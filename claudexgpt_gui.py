@@ -25,7 +25,11 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_DIR = Path(__file__).resolve().parent
 CLI_PATH = APP_DIR / "claudexgpt.py"
-DEFAULT_OUTPUTS_DIR = r"F:\ClaudeXGPT_outputs"
+
+# Import the real default rather than duplicating the constant - keeps this in
+# sync with claudexgpt.py automatically instead of two copies drifting apart.
+sys.path.insert(0, str(APP_DIR))
+from claudexgpt import DEFAULT_OUTPUTS_DIR  # noqa: E402
 
 COLORS = {
     "bg": "#111315",
@@ -58,9 +62,15 @@ class ClaudeCGptGui(tk.Tk):
         self.worker = None
         self.messages = queue.Queue()
         self.latest_run_dir = None
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.python_var = tk.StringVar(value=sys.executable)
-        self.target_var = tk.StringVar(value=str(APP_DIR))
+        # Deliberately blank, not APP_DIR: defaulting the target to this
+        # project's own folder means an unchanged "Run" click silently copies
+        # this folder instead of erroring. Blank makes the existing
+        # is_dir() validation catch it and force an explicit pick, same
+        # principle as the CLI's own explicit-choice design throughout.
+        self.target_var = tk.StringVar(value="")
         self.outputs_var = tk.StringVar(value=DEFAULT_OUTPUTS_DIR)
         self.timeout_var = tk.StringVar(value="1800")
         self.cross_review_var = tk.BooleanVar(value=False)
@@ -68,7 +78,7 @@ class ClaudeCGptGui(tk.Tk):
         self.keep_workspaces_var = tk.BooleanVar(value=True)
         self.yolo_var = tk.BooleanVar(value=False)
         self.apply_run_var = tk.StringVar(value="")
-        self.apply_target_var = tk.StringVar(value=str(APP_DIR))
+        self.apply_target_var = tk.StringVar(value="")
         self.apply_which_var = tk.StringVar(value="claude")
         self.apply_yes_var = tk.BooleanVar(value=False)
 
@@ -257,6 +267,7 @@ class ClaudeCGptGui(tk.Tk):
         text.configure(yscrollcommand=scroll.set)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.configure(state=tk.DISABLED)
         return text
 
     def _browse_python(self):
@@ -289,7 +300,12 @@ class ClaudeCGptGui(tk.Tk):
         text_widget.configure(state=tk.NORMAL)
         text_widget.insert(tk.END, text)
         text_widget.see(tk.END)
+        text_widget.configure(state=tk.DISABLED)
+
+    def _clear_log(self, text_widget):
         text_widget.configure(state=tk.NORMAL)
+        text_widget.delete("1.0", tk.END)
+        text_widget.configure(state=tk.DISABLED)
 
     def _set_running(self, running):
         state = tk.DISABLED if running else tk.NORMAL
@@ -328,7 +344,7 @@ class ClaudeCGptGui(tk.Tk):
         if self.yolo_var.get():
             cmd.append("--yolo")
 
-        self.log_text.delete("1.0", tk.END)
+        self._clear_log(self.log_text)
         self._run_subprocess(cmd, self.log_text, "Running...")
 
     def _start_apply(self):
@@ -362,7 +378,7 @@ class ClaudeCGptGui(tk.Tk):
             "--yes",
         ]
 
-        self.apply_log_text.delete("1.0", tk.END)
+        self._clear_log(self.apply_log_text)
         self._run_subprocess(cmd, self.apply_log_text, "Applying...")
 
     def _run_subprocess(self, cmd, log_widget, status):
@@ -420,8 +436,29 @@ class ClaudeCGptGui(tk.Tk):
 
     def _stop_process(self):
         if self.proc is not None:
-            self.proc.terminate()
+            self._kill_process_tree(self.proc.pid)
             self.status_var.set("Stopping...")
+
+    def _kill_process_tree(self, pid):
+        # proc.terminate() only signals the immediate claudexgpt.py process,
+        # not the claude/codex child processes it may have spawned via
+        # subprocess.run() - those would be left running in the background,
+        # still consuming API usage, with the GUI showing "Stopped". /T kills
+        # the whole tree rooted at pid instead of just the one process.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _on_close(self):
+        # Closing the window shouldn't leave a claude/codex call running
+        # unattended in the background - same reasoning as the Stop button.
+        if self.proc is not None:
+            self._kill_process_tree(self.proc.pid)
+        self.destroy()
 
     def _open_latest_output(self):
         if self.latest_run_dir:

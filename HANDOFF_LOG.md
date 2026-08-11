@@ -387,3 +387,29 @@ Verification:
 Still open:
 
 - Full manual GUI run through both agents was not performed from the GUI itself, to avoid spending more agent/API quota. The GUI invokes the already-tested CLI path.
+
+### 2026-08-11 (local) - reviewed and amended the GUI
+
+Marked by: Claude/VS Code
+
+User asked me to check out `claudexgpt_gui.py` and amend if needed. Read it fully and found four real issues, fixed all four:
+
+1. **Orphaned-process risk on Stop/close (the important one, given the current Codex-usage constraint above).** `_stop_process` only called `self.proc.terminate()`, which signals the immediate `claudexgpt.py` process but not the `claude`/`codex` child processes it spawns via `subprocess.run()` inside its own thread pool - those are separate child processes of `claudexgpt.py`, not of the GUI, and Windows doesn't kill a process's children automatically when the parent dies. So hitting Stop (or closing the window) mid-run could leave an actual `codex exec` call running in the background with the GUI showing "Stopped" - silently burning quota with no indication. Fixed by adding `_kill_process_tree()` (uses `taskkill /F /T /PID`, which kills the whole tree rooted at the given PID) and calling it from both `_stop_process` and a new `WM_DELETE_WINDOW` handler (`_on_close`) for the window-close case. Verified directly: spawned a dummy parent+grandchild process pair (no CLI involved), confirmed the old approach would only kill the parent, confirmed `_kill_process_tree` kills both (checked via `tasklist` after).
+2. **Target/Apply-target defaulted to the project's own folder** (`str(APP_DIR)`) instead of being blank. Same category of mistake as the disk-crisis bug from earlier - an unchanged default that looks harmless but means clicking "Run" without picking a target first silently operates on the wrong (though much smaller, in this case) directory instead of erroring. Changed both to default to `""`, which the existing `is_dir()` validation already correctly rejects, forcing an explicit pick - no new validation logic needed, just removed the bad default.
+3. **`DEFAULT_OUTPUTS_DIR` duplicated as a second hardcoded constant** in the GUI file instead of reusing `claudexgpt.py`'s. Would silently drift out of sync if the CLI's default ever changes. Changed to `from claudexgpt import DEFAULT_OUTPUTS_DIR` (safe - `claudexgpt.py` only executes `main()` behind its own `if __name__ == "__main__"` guard, so importing it as a module has no side effects).
+4. **Log text widgets were always editable.** `_append_log` set `state=tk.NORMAL` twice (looks like a copy-paste slip where the second call should have re-disabled it) and `_make_log` never set an initial disabled state either - so the output log was always user-editable, which a log/output pane shouldn't be. Fixed `_append_log` to re-disable after inserting, set the initial state to disabled in `_make_log`, and added a `_clear_log` helper (toggles state around `.delete()`, since a disabled Text widget silently ignores both interactive and programmatic edits) - updated the two places that used to call `.delete()` directly on the log widgets to use it instead.
+
+Verification:
+```powershell
+C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py claudexgpt.py
+```
+Result: compiled clean.
+
+- Tk smoke test: instantiated the app, confirmed `target_var`/`apply_target_var` are now `''`, confirmed `outputs_var` correctly reads `F:\ClaudeXGPT_outputs` via the import, confirmed both log widgets start `disabled`, destroyed cleanly.
+- Log cycle test: `_clear_log` then `_append_log` produces exactly the expected content, widget ends `disabled`, and a simulated user `.insert()` afterward is correctly blocked (content unchanged) - confirms the read-only behavior actually holds, not just that the state flag is set.
+- Process-tree kill test: spawned a real parent+grandchild subprocess pair (dummy Python scripts, no CLI/agent involved), called `_kill_process_tree` on the parent's PID, confirmed via `tasklist` that both parent and grandchild were gone afterward - directly validates the fix for the risk described in point 1.
+- **Actually launched the real GUI as a live window** (not just instantiate-and-destroy) and captured a real screenshot (via `taskkill`-adjacent `user32.dll` P/Invoke from PowerShell to locate the window by title and `System.Drawing` to capture the screen, since `Process.MainWindowHandle` didn't resolve reliably for this Tk process - had to enumerate windows by title instead). Confirmed visually: theme renders as described (Claude orange circle/label, GPT white square/label, green wireframe bridge with "green wireframe exchange layer" caption), Target field is blank as fixed, Outputs field correctly shows `F:\ClaudeXGPT_outputs`, Stop button correctly disabled with nothing running, log area styled correctly. Did not click into a real Run (would spend Codex quota) - stopped at visual/structural confirmation.
+
+None of this required running `claude` or `codex` for real - respected the constraint above throughout.
+
+Not yet committed/pushed.
