@@ -47,6 +47,11 @@ USE_SHELL = sys.platform.startswith("win")
 CLAUDE_BIN = "claude"
 CODEX_BIN = "codex"
 
+# C: is space-constrained on this machine (ran to near-zero free space once
+# already - see HANDOFF_LOG.md). Default output location lives on F: instead,
+# which has the most headroom. Override anytime with --outputs-dir.
+DEFAULT_OUTPUTS_DIR = r"F:\ClaudeXGPT_outputs"
+
 # Vendor/build directories excluded when copying the target directory into
 # each tool's disposable workspace. Edit this list if your project needs
 # something else excluded (or nothing at all).
@@ -300,7 +305,11 @@ def main():
         help="Read the task description from a UTF-8 text file. Useful for multi-line prompts.",
     )
     parser.add_argument("-C", "--dir", default=".", help="Target directory to work in (default: current directory).")
-    parser.add_argument("--outputs-dir", default="outputs", help="Where to write results (default: ./outputs).")
+    parser.add_argument(
+        "--outputs-dir", default=DEFAULT_OUTPUTS_DIR,
+        help=f"Where to write results (default: {DEFAULT_OUTPUTS_DIR} - kept off C: on purpose, "
+             "which is space-constrained on this machine; override anytime).",
+    )
     parser.add_argument("--timeout", type=int, default=1800, help="Per-tool timeout in seconds (default: 1800).")
     parser.add_argument(
         "--yolo", action="store_true",
@@ -373,6 +382,12 @@ def main():
         sys.exit(1)
 
     run_root = outputs_dir / timestamp
+
+    print(f"Task: {task}")
+    print(f"Target directory: {target}")
+    print(f"Output directory: {run_root}")
+    sys.stdout.flush()
+
     run_root.mkdir(parents=True, exist_ok=True)
 
     repo_mode = is_git_repo(target)
@@ -383,14 +398,21 @@ def main():
     codex_cmd = [CODEX_BIN, "exec", "-", "--skip-git-repo-check"]
     codex_cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
 
+    print("Copying target directory into isolated workspaces (can take a while for larger projects)...")
+    sys.stdout.flush()
+
     jobs = []
     try:
         if claude_path:
             ws = run_root / "claude_workspace"
+            print(f"- copying for claude -> {ws}")
+            sys.stdout.flush()
             shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
             jobs.append(("claude", claude_cmd, ws))
         if codex_path:
             ws = run_root / "codex_workspace"
+            print(f"- copying for codex -> {ws}")
+            sys.stdout.flush()
             shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
             jobs.append(("codex", codex_cmd, ws))
     except OSError as e:
@@ -398,10 +420,10 @@ def main():
         print("No CLI has been run yet - nothing to clean up beyond the partial copy above.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Task: {task}")
-    print(f"Target directory: {target}")
+    print("Copies done.")
     print(f"Git repo detected: {repo_mode}")
-    print(f"Running {len(jobs)} tool(s), timeout {args.timeout}s each...")
+    print(f"Running {len(jobs)} tool(s), timeout {args.timeout}s each - this is the slow part, please wait...")
+    sys.stdout.flush()
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:

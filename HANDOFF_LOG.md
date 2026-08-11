@@ -282,3 +282,41 @@ Anything still risky/unfinished:
 
 - The new guard only checks the `outputs_dir`/`target` relationship once, at startup. It does not (and doesn't need to) protect against a user manually pointing `--outputs-dir` somewhere unrelated that happens to have its own separate problems (e.g. a network drive, a read-only path) - those still fail via the new `OSError` handling around copytree, just with a generic message rather than a specific diagnosis.
 - Revision's happy path was only verified against a stub for Codex, not two real CLIs simultaneously (blocked by the quota until Codex is unblocked). The orchestration logic is confirmed correct; the actual quality of a real Codex revision response is unverified.
+
+### 2026-08-11 (local) - fixed a real "looks frozen" UX bug
+
+Marked by: Claude/VS Code
+
+User reported: after typing a task at the interactive `Task description:` prompt and hitting Enter, the terminal just stops - nothing prints, looks hung.
+
+Root cause, confirmed by reading the code: `print(f"Task: {task}")` and the rest of the startup summary were placed *after* both `shutil.copytree` calls in `main()`, not before. Those copies can take real time on anything bigger than a toy repo, and during that whole window nothing was printed at all - looked exactly like a frozen terminal, because from the user's perspective it was silent from the moment they hit Enter until the first tool actually finished running.
+
+Fix: moved `Task:` / `Target directory:` / new `Output directory:` prints to immediately after input is read and validated, before `run_root.mkdir()` or any copying starts. Added an explicit "Copying target directory into isolated workspaces (can take a while for larger projects)..." line plus a per-tool "- copying for claude/codex -> <path>" line right before each `shutil.copytree` call, and a "Copies done." after. Added `sys.stdout.flush()` at each of these points as a defensive measure in case output isn't line-buffered in whatever terminal it's run from.
+
+Verification:
+```powershell
+python -m py_compile claudexgpt.py
+```
+Result: compiled clean.
+
+Smoke test: real Claude + real Codex (Codex succeeded this run - quota may have reset), default mode, throwaway git repo. Confirmed the full startup summary (task, target dir, output dir, copy-in-progress lines, "Copies done.", git-repo-detected, running-N-tools) now all print immediately, well before either CLI actually starts - no more silent gap between hitting Enter and seeing output.
+
+Not yet committed/pushed - same as everything else recently, holding for the user's go-ahead.
+
+### 2026-08-11 (local) - default --outputs-dir moved to F:
+
+Marked by: Claude/VS Code
+
+User hit the self-copy guard again (correctly - ran with no `-C`/`--outputs-dir`, defaults resolved to `C:\Users\Rebel` both ways) and said to use D: or F: as the dumping location if one is needed. Checked free space: C: 66G free, D: 635G free, F: 1.1T free (most headroom) - picked F:.
+
+Changed `--outputs-dir` default from relative `"outputs"` to `DEFAULT_OUTPUTS_DIR = r"F:\ClaudeXGPT_outputs"` (new constant near the top, alongside `CLAUDE_BIN`/`CODEX_BIN`). Still fully overridable via `--outputs-dir` as before - this only changes what happens when it's left unset.
+
+Verification:
+```powershell
+python -m py_compile claudexgpt.py
+```
+Result: compiled clean.
+
+Smoke test: real run with explicit small `-C` (a throwaway repo, not the home directory) and no `--outputs-dir` - confirmed output landed under `F:\ClaudeXGPT_outputs\<timestamp>\` automatically, no flag needed.
+
+Note not acted on: the user's failing command still had no `-C` either, meaning target defaulted to `C:\Users\Rebel` (their whole home folder) - this fix only relocates *outputs*, it doesn't stop someone from pointing the *target* at their home directory, which would still copy ~170GB into two workspaces even with the disk-safety guard passing. Flagged this to the user directly rather than silently guessing they meant something else; not a code change since there's nothing invalid about deliberately targeting a huge directory, just wasteful.
