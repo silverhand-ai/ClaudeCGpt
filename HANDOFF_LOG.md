@@ -8,6 +8,10 @@ Shared coordination log for Cody/Codex and Claude/VS Code so work does not overl
 - Main script: `claudexgpt.py`
 - GitHub repo reserved: `https://github.com/silverhand-ai/ClaudeCGpt`
 
+## Current Constraints
+
+- **2026-08-11: Claude/VS Code should not invoke `codex` CLI for a while** (no smoke tests, no primary/review/revise calls through `claudexgpt.py`). User needs Codex's usage headroom for something else right now. Any work that would normally require running Codex to verify should be skipped and flagged here for Cody/Codex to pick up and finish once it's back in use - not worked around by Claude. Lift this note once the user says Codex is free to use again.
+
 ## Phase 1 Target
 
 Build the smallest useful ClaudeCGpt bridge:
@@ -320,3 +324,36 @@ Result: compiled clean.
 Smoke test: real run with explicit small `-C` (a throwaway repo, not the home directory) and no `--outputs-dir` - confirmed output landed under `F:\ClaudeXGPT_outputs\<timestamp>\` automatically, no flag needed.
 
 Note not acted on: the user's failing command still had no `-C` either, meaning target defaulted to `C:\Users\Rebel` (their whole home folder) - this fix only relocates *outputs*, it doesn't stop someone from pointing the *target* at their home directory, which would still copy ~170GB into two workspaces even with the disk-safety guard passing. Flagged this to the user directly rather than silently guessing they meant something else; not a code change since there's nothing invalid about deliberately targeting a huge directory, just wasteful.
+
+### 2026-08-11 (local) - Phase 4: `--apply` (human-selection apply helper)
+
+Marked by: Claude/VS Code
+
+User said to build "whatever's next" while the Codex-usage constraint above is in effect. Landed on Phase 4 from the earlier roadmap discussion (Cody/Codex's original proposal, both of us agreed it was the right next step, unlike Phase 5's "combined patch synthesis" which I'd flagged as conflicting with the whole project's "no auto-merge" principle - not built, and I don't think it should be without a very different framing). Good fit for the current constraint too: applying an already-saved diff to the real target is pure git/file operations, no CLI usage at all.
+
+What it does: new `--apply <run_dir> --apply-which {claude,codex,claude_revised,codex_revised}` mode. Short-circuits at the top of `main()` before any task-reading, CLI-availability checks, or workspace copying - it's a fully separate code path (`run_apply_mode()`), not a variant of the normal run. Takes `<run_dir>/<which>.diff` (a file already produced by a past normal run) and applies it to the target directory (`-C`/`--dir`) via `git apply`, after printing the full diff and target path and requiring explicit `y/N` confirmation (`--yes` skips the prompt for scripted use). This is the only code path in the whole tool that writes to the real target directory - every other mode only ever touches disposable copies.
+
+Safety behavior:
+- Refuses if `--apply-which` wasn't given.
+- Refuses if the named diff file doesn't exist in `run_dir` (tool wasn't run there, was skipped, or run wasn't against a git repo).
+- If the diff file exists but is empty (that tool made no changes), reports that and exits 0 - nothing to do, not an error.
+- Refuses if the target isn't a git repo (needs `git apply`).
+- Refuses if the target has any uncommitted changes (`git status --porcelain` non-empty) - won't mix the applied diff with unrelated edits.
+- Runs `git apply --check` before the real `git apply`, so a diff that doesn't apply cleanly (e.g. target has diverged, or already has these changes) fails with git's own error and changes nothing, rather than a partial/broken apply.
+
+Still true here same as everywhere else in this tool: no auto-merge, no scoring, no winner picked - the human already decided by choosing `--apply-which`.
+
+Verification (all via hand-crafted fixtures / a zero-API-call stub, per the current Codex constraint - no real `codex exec` calls were made):
+```powershell
+python -m py_compile claudexgpt.py
+```
+Result: compiled clean.
+
+1. Hand-crafted a throwaway git repo + a synthetic `claude.diff` (no CLI involved at all) to test the apply mechanics in isolation: decline (`n`) leaves target untouched; accept (`y`) applies correctly and the new file's content is exactly right.
+2. Confirmed the dirty-target refusal by leaving the applied file uncommitted and re-running - refused with the uncommitted-changes message, then committed and re-tested clean.
+3. Missing `--apply-which` errors clearly. Missing diff file (`--apply-which codex` when only `claude.diff` exists) errors clearly. Empty diff file reports "nothing to apply" and exits 0.
+4. Re-applying an already-applied diff correctly fails at the `git apply --check` stage ("already exists in working directory"), target stays untouched, exit 1.
+5. `--yes` correctly skips the confirmation prompt.
+6. Full real-workflow regression: ran a normal (no `--apply`) pass with a real Claude call and a zero-API-call Codex stub (`exit /b 0`, never contacts the API) against a throwaway repo - output set identical to before Phase 4, confirming the new argparse options didn't break the normal path. Then applied the real `claude.diff` produced by that run to the same repo with `--apply` - worked end to end, file landed with the exact content Claude wrote.
+
+Not yet committed/pushed. Nothing here required Codex - the constraint noted above is still in effect and wasn't touched.

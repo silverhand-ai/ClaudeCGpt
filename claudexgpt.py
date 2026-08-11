@@ -29,6 +29,13 @@ on purpose). Still no merge/scoring/winner - a third round of files.
 Tasks are piped via stdin to both CLIs, so multi-line prompts and prompts
 loaded from --task-file do not have to survive cmd.exe argv quoting on
 Windows.
+
+Optional --apply <run_dir> --apply-which {claude,codex,claude_revised,codex_revised}:
+applies an already-saved diff from a past run to the real target directory
+(-C/--dir), after showing it and asking for explicit y/N confirmation. This
+is the only thing in the whole tool that writes to the real target - every
+other mode only ever touches disposable copies. The human already chose by
+picking --apply-which; there is still no auto-merge, scoring, or winner.
 """
 
 import argparse
@@ -294,6 +301,90 @@ def print_output_guide(run_root, primary, cross_review, revise=False):
               f"(+ .diff if it changed anything)")
 
 
+APPLY_CHOICES = ("claude", "codex", "claude_revised", "codex_revised")
+
+
+def run_apply_mode(args):
+    """The only thing in this tool that writes to the real target directory.
+    Takes an already-saved diff from a past run and applies it, after showing
+    it in full and getting explicit confirmation. No merge, no scoring, no
+    auto-picking - the human already picked by choosing --apply-which."""
+    if not args.apply_which:
+        print("--apply requires --apply-which {claude,codex,claude_revised,codex_revised}.", file=sys.stderr)
+        sys.exit(1)
+
+    run_dir = Path(args.apply).resolve()
+    if not run_dir.is_dir():
+        print(f"--apply directory does not exist: {run_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    diff_path = run_dir / f"{args.apply_which}.diff"
+    if not diff_path.is_file():
+        print(
+            f"No diff file found for '{args.apply_which}' in {run_dir} (expected {diff_path.name}). "
+            "Either that tool wasn't run in that folder, made no changes, was skipped, or the run "
+            "wasn't against a git repo.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    diff_text = diff_path.read_text(encoding="utf-8")
+    if not diff_text.strip():
+        print(f"{diff_path.name} is empty - '{args.apply_which}' made no changes in that run. Nothing to apply.")
+        sys.exit(0)
+
+    target = Path(args.dir).resolve()
+    if not target.is_dir():
+        print(f"Target directory does not exist: {target}", file=sys.stderr)
+        sys.exit(1)
+
+    if not is_git_repo(target):
+        print(f"Target directory is not a git repository: {target}. --apply uses 'git apply', so the "
+              "target must be a git repo.", file=sys.stderr)
+        sys.exit(1)
+
+    status = subprocess.run(
+        ["git", "-C", str(target), "status", "--porcelain"], capture_output=True, text=True, timeout=15
+    )
+    if status.stdout.strip():
+        print(
+            f"Refusing to apply: target directory has uncommitted changes:\n\n{status.stdout}\n"
+            "Commit or stash them first, so this diff doesn't get mixed in with unrelated edits.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"About to apply '{args.apply_which}' from {run_dir} to {target}:\n")
+    print(diff_text)
+    print(f"Target: {target}")
+    print(f"Diff: {diff_path}")
+
+    if not args.yes:
+        answer = input("\nApply this diff to the target directory? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Not applied.")
+            sys.exit(0)
+
+    check = subprocess.run(
+        ["git", "-C", str(target), "apply", "--check", str(diff_path)], capture_output=True, text=True, timeout=30
+    )
+    if check.returncode != 0:
+        print(f"Diff does not apply cleanly to {target}:\n{check.stderr}", file=sys.stderr)
+        print("Nothing was changed.", file=sys.stderr)
+        sys.exit(1)
+
+    result = subprocess.run(
+        ["git", "-C", str(target), "apply", str(diff_path)], capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        print(f"git apply failed:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\nApplied. {target} now has the changes from '{args.apply_which}' ({run_dir.name}).")
+    print("Nothing else was decided for you - review the result yourself (git diff, git status, tests, etc.).")
+    sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="claudexgpt",
@@ -304,7 +395,28 @@ def main():
         "--task-file",
         help="Read the task description from a UTF-8 text file. Useful for multi-line prompts.",
     )
-    parser.add_argument("-C", "--dir", default=".", help="Target directory to work in (default: current directory).")
+    parser.add_argument(
+        "-C", "--dir", default=".",
+        help="Target directory to work in (default: current directory). With --apply, this is the real "
+             "directory the chosen diff gets applied to.",
+    )
+    parser.add_argument(
+        "--apply", metavar="RUN_DIR",
+        help="Apply an already-saved diff from a past run (RUN_DIR is an outputs/<timestamp> folder) to "
+             "the target directory (-C/--dir), instead of running any CLI. Requires --apply-which. Shows "
+             "the full diff and target, then asks for explicit y/N confirmation (skip with --yes). Refuses "
+             "if the target has uncommitted changes or the diff doesn't apply cleanly. This is the only "
+             "thing in this tool that writes to your real target directory - everything else only ever "
+             "touches disposable copies. No merge, no scoring - you already chose by picking --apply-which.",
+    )
+    parser.add_argument(
+        "--apply-which", choices=APPLY_CHOICES,
+        help="Which saved result to apply when using --apply.",
+    )
+    parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt for --apply. Has no effect otherwise.",
+    )
     parser.add_argument(
         "--outputs-dir", default=DEFAULT_OUTPUTS_DIR,
         help=f"Where to write results (default: {DEFAULT_OUTPUTS_DIR} - kept off C: on purpose, "
@@ -342,6 +454,10 @@ def main():
              "winner - a third round of files to read, nothing more. Off by default.",
     )
     args = parser.parse_args()
+
+    if args.apply:
+        run_apply_mode(args)
+        return
 
     task = read_task(args)
     if not task:
