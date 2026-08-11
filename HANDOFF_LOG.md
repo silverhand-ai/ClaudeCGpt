@@ -208,3 +208,77 @@ Anything still risky/unfinished:
 
 - Cross-review review-prompt construction embeds the *entire* stdout/stderr of the reviewed tool's primary run. For a very large/verbose primary run this could make the review prompt large; no truncation was added (kept minimal per the "small, stdlib-only" constraint) - a real concern only for unusually large tasks.
 - Not addressed (pre-existing, out of scope for Phase 2): Phase 1's own primary task argument is still passed as an argv element through `cmd.exe`, so a user-supplied task description containing embedded newlines could hit the same quoting risk that motivated stdin for review prompts. Only cross-review's own prompts were changed to use stdin.
+
+### 2026-08-11 (local) - verified an unlogged update
+
+Marked by: Claude/VS Code
+
+Found `claudexgpt.py` had been changed (no matching entry here, so I couldn't tell who by - reads like Codex given it directly closes the item I flagged above). Verified it rather than assuming it's safe, per the coordination rule.
+
+What changed (as found, not by me):
+
+- Added `--task-file` flag + `read_task()` - reads the task from a UTF-8 file instead of the CLI arg.
+- Primary `claude`/`codex` calls now pipe the task via stdin instead of passing it as an argv element (`claude -p` with no positional prompt; `codex exec -`). This is exactly the fix for the risk I noted in my last entry (task text surviving `cmd.exe` argv quoting).
+- Added `print_output_guide()` - prints a full list of every output file's path at the end of a run.
+
+Verification performed:
+
+```powershell
+python -m py_compile claudexgpt.py
+```
+Result: compiled clean.
+
+Smoke tests (throwaway git repo, temp scratch dir):
+1. Default mode, task as CLI arg: Claude ran fine over stdin. Codex failed - but with `ERROR: You've hit your usage limit. Upgrade to Plus to continue using Codex... or try again at Sep 9th, 2026` in stderr. That's an account-level quota limit, unrelated to this code change - and the script handled it exactly as designed (`status: failed`, clear error captured in `codex_output.txt`, no crash, Claude's run unaffected).
+2. `--task-file` with a genuinely multi-line task, plus `--cross-review`, against the same repo: file was read correctly, real newlines preserved through to Claude (confirmed in the diff - it correctly implemented what the multi-line task asked for), `claude_review_of_codex` correctly skipped with a reason (`codex` didn't complete successfully) via `_SKIPPED.txt`, `codex_review_of_claude` was attempted and correctly captured the same quota failure as `status: failed`, no crash.
+
+Operationally important: **Codex CLI on this account is rate-limited until 2026-09-09** (per the error above). Any `claudexgpt.py` run before then will show Codex as failed - that's the account, not the tool.
+
+Note for whoever made this change: please add your own dated entry for it per the Coordination Rule below - I'm logging this as a verification pass on an already-made change, not as the change's own record.
+
+Also fixed a small doc bug while I was in there: README's "Verified CLI forms" section still showed the task embedded as a quoted argv element (`claude -p "<task>"` / `codex exec "<task>"`), which contradicted the correct stdin explanation elsewhere in the same file. Updated to `claude -p ...` / `codex exec - ...` with no task in the argv, matching actual current behavior.
+
+### 2026-08-11 (local) - starting Phase 3: optional `--revise` mode
+
+Marked by: Claude/VS Code
+
+User asked what Phase 3 should be. Landed on: give each tool exactly one chance to revise its own output using the review written about it, still no merge/scoring/winner. User specifically flagged the cost/prompt-size tradeoff (this stacks a 3rd LLM call on top of primary+review, and naively could stack the same growing context each time) and asked for a mitigation before building it. Agreed approach:
+
+- New `--revise` flag, separate from `--cross-review`. Passing `--revise` implies cross-review runs too (revision needs a review to work from) - `--cross-review` alone still means "just the two reviews, no revision," same as today.
+- Revision prompt is deliberately trimmed, not a naive stack: task + the tool's own diff (already have it) + the *other* tool's review text of it (already have it, already concise by design). It does **not** re-embed the tool's own original stdout/stderr - that was only needed once, to generate the review; revision doesn't need to see its own rambling again, just the diff and the verdict.
+- Revision runs in the tool's own existing primary workspace (already has the code from its first attempt), not a fresh copy - reuses `primary[name]["ws"]`, same permission/sandbox flags as the primary run (this is a tool editing its own prior work, not reviewing someone else's - the read-only constraint from cross-review doesn't apply here).
+- Output: `claude_revised_output.txt` / `codex_revised_output.txt` (stdout/stderr) and `claude_revised.diff` / `codex_revised.diff` (cumulative diff of the workspace after revision, i.e. original attempt + revision combined) - if not a git repo, diff is skipped same as primary.
+- Skipped (with a `_SKIPPED.txt` marker) if: the tool's own primary run didn't succeed, or the review written about it wasn't produced successfully (skipped/failed) - nothing to revise from in that case.
+- Still no comparison/scoring between "before" and "after" diffs done by the script itself - that's on the human, same principle as everything else here.
+
+Will implement, then verify with `python -m py_compile` and a real smoke test, then report back.
+
+### 2026-08-11 (local) - Phase 3 complete, plus a real bug found and fixed
+
+Marked by: Claude/VS Code
+
+Implemented `--revise` as planned above. Verification:
+
+```powershell
+python -m py_compile claudexgpt.py
+```
+Result: compiled clean.
+
+Smoke tests (throwaway git repo, temp scratch dir):
+1. Real Claude + a stubbed `codex.cmd` (Codex's account is still quota-limited, so a real full happy-path run wasn't possible - see the earlier entry). Stub distinguishes `-s read-only` (review) vs `-s workspace-write` (primary/revise) calls so the actual orchestration logic gets exercised for real, only the "AI content" is canned. Full pipeline ran clean: both primaries ok -> both reviews ok -> both revisions ok. Claude's revision correctly left its file untouched because the (stubbed) review said it looked fine - confirms the "don't make unnecessary changes" instruction in the revision prompt is being followed, and confirms the trimmed prompt (task + own diff + review text, no re-embedded stdout) is sufficient for the model to make that call.
+2. Default mode (no flags), real CLIs: identical output set to before Phase 3, no cross-review/revise sections - confirms no regression.
+3. `--cross-review` alone (no `--revise`), real Claude + stub Codex: reviews ran, no revision files appeared - confirms `--revise` is the only thing that triggers revision, `--cross-review` alone is unchanged from Phase 2.
+4. `--no-keep-workspaces` + `--revise` together: needed to confirm workspace cleanup was correctly deferred until after revision (revision needs the workspace as `cwd`) - this is where things got interesting, see below.
+
+**Found a real, unrelated bug while running test 4, not caused by Phase 3's own code:** the user's C: drive was down to 88 KB free (out of 238 GB) mid-test. Investigated (with permission) rather than assuming it was pre-existing background noise. Root cause: `C:\Users\Rebel\outputs\` contained ~36 GB from an earlier run where the tool was invoked with both `-C` and `--outputs-dir` left at their defaults while the working directory was the user's home folder (`C:\Users\Rebel`) - meaning `outputs_dir` (default `"outputs"`, relative) resolved to a subdirectory *inside* the target being copied. `shutil.copytree` has no built-in protection against copying a directory into a subdirectory of itself - confirmed this directly in an isolated sandbox test. Because the target was enormous (135 GB) and the copy took a long time, the growing `outputs/` folder kept getting swept up into its own copy as it went, ballooning disk usage.
+
+Fix applied to `claudexgpt.py`:
+- Before creating `run_root` or copying anything, check whether `outputs_dir` is equal to or nested inside `target`. If so, refuse to run with a clear error explaining why, instead of silently copying the target into itself. Verified this blocks the exact reproduced hazard with zero side effects, and does not affect the normal documented usage pattern (target and outputs-dir in different locations, as in the README example) - re-tested that path after the fix, still works.
+- Wrapped the primary `shutil.copytree` calls in `try/except OSError` so a disk-full or permission error during the copy fails with a clear message and `sys.exit(1)` instead of an unhandled traceback.
+
+Disk cleanup itself (deleting the accumulated `C:\Users\Rebel\outputs\`) is a separate action from this code fix - handled directly with the user, not logged as script behavior since it's not something `claudexgpt.py` did to fix itself, it's manual cleanup of a past mistake.
+
+Anything still risky/unfinished:
+
+- The new guard only checks the `outputs_dir`/`target` relationship once, at startup. It does not (and doesn't need to) protect against a user manually pointing `--outputs-dir` somewhere unrelated that happens to have its own separate problems (e.g. a network drive, a read-only path) - those still fail via the new `OSError` handling around copytree, just with a generic message rather than a specific diagnosis.
+- Revision's happy path was only verified against a stub for Codex, not two real CLIs simultaneously (blocked by the quota until Codex is unblocked). The orchestration logic is confirmed correct; the actual quality of a real Codex revision response is unverified.

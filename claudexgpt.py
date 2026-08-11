@@ -20,6 +20,15 @@ unchanged): after both primary runs finish, has Claude review Codex's
 result and Codex review Claude's, read-only (claude --tools "", codex
 -s read-only - neither can write files during review). Still no
 merging, scoring, or winner - just two more files to read.
+
+Optional --revise (implies --cross-review): gives each tool exactly one
+chance to revise its own prior work using the review written about it
+(own diff + that review's text, not its own stdout again - kept small
+on purpose). Still no merge/scoring/winner - a third round of files.
+
+Tasks are piped via stdin to both CLIs, so multi-line prompts and prompts
+loaded from --task-file do not have to survive cmd.exe argv quoting on
+Windows.
 """
 
 import argparse
@@ -140,6 +149,21 @@ def format_cmd(cmd):
     )
 
 
+def read_task(args):
+    if args.task and args.task_file:
+        print("Provide either a task argument or --task-file, not both.", file=sys.stderr)
+        sys.exit(1)
+    if args.task_file:
+        try:
+            return Path(args.task_file).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            print(f"Could not read task file: {e}", file=sys.stderr)
+            sys.exit(1)
+    if args.task:
+        return args.task.strip()
+    return input("Task description: ").strip()
+
+
 def write_output_file(path, result, diff_text):
     lines = [
         f"Tool: {result['name']}",
@@ -187,6 +211,25 @@ def build_review_prompt(task, reviewed_name, reviewed_result, diff_text):
     )
 
 
+def build_revision_prompt(task, own_diff, review_text):
+    """Deliberately does NOT re-embed the tool's own original stdout/stderr - that
+    was only needed once, to produce the review. Revision only needs the diff it
+    produced and the verdict on it, to keep this from stacking prompt size on
+    top of the (already trimmed) review step."""
+    diff_section = own_diff if own_diff else "(no changes made previously)"
+    return (
+        f"ORIGINAL TASK:\n{task}\n\n"
+        "You previously attempted this task. Below is your own diff from that attempt, "
+        "followed by another AI tool's review of it.\n\n"
+        f"YOUR PREVIOUS DIFF:\n{diff_section}\n\n"
+        f"REVIEW OF YOUR ATTEMPT:\n{review_text or '(empty)'}\n\n"
+        "If the review identifies real problems, revise your files in this workspace to address "
+        "them. If the review finds no real issues, leave your files as they are - do not make "
+        "unnecessary changes.\n\n"
+        "This is your own workspace from your previous attempt; make changes directly, as you did before."
+    )
+
+
 def build_reviewer_cmd(reviewer_name):
     """Commands for review mode always run read-only, regardless of --yolo:
     the review must never write files, so this isn't user-configurable."""
@@ -228,12 +271,34 @@ def print_summary(result, output_path, diff_path):
         print(f"diff saved to: {diff_path}")
 
 
+def print_output_guide(run_root, primary, cross_review, revise=False):
+    print("\nOutput guide:")
+    for name in ("claude", "codex"):
+        print(f"- {name} output: {run_root / f'{name}_output.txt'}")
+        if name in primary:
+            print(f"- {name} workspace: {primary[name]['ws']}")
+            if primary[name]["diff_text"] is not None:
+                print(f"- {name} diff: {run_root / f'{name}.diff'}")
+    if cross_review:
+        print(f"- Claude review of Codex: {run_root / 'claude_review_of_codex.txt'}")
+        print(f"- Codex review of Claude: {run_root / 'codex_review_of_claude.txt'}")
+    if revise:
+        print(f"- Claude revised (using Codex's review): {run_root / 'claude_revised_output.txt'} "
+              f"(+ .diff if it changed anything)")
+        print(f"- Codex revised (using Claude's review): {run_root / 'codex_revised_output.txt'} "
+              f"(+ .diff if it changed anything)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="claudexgpt",
         description="Run a task through Claude Code and Codex CLI non-interactively; save outputs; show diffs. No merging, no deciding.",
     )
     parser.add_argument("task", nargs="?", help="Task description. If omitted, you'll be prompted.")
+    parser.add_argument(
+        "--task-file",
+        help="Read the task description from a UTF-8 text file. Useful for multi-line prompts.",
+    )
     parser.add_argument("-C", "--dir", default=".", help="Target directory to work in (default: current directory).")
     parser.add_argument("--outputs-dir", default="outputs", help="Where to write results (default: ./outputs).")
     parser.add_argument("--timeout", type=int, default=1800, help="Per-tool timeout in seconds (default: 1800).")
@@ -257,9 +322,19 @@ def main():
              "that side is skipped with a _SKIPPED.txt marker explaining why. No merging, scoring, or winner "
              "is chosen. Off by default; does not affect default behavior.",
     )
+    parser.add_argument(
+        "--revise", action="store_true",
+        help="After cross-review (implied automatically if this is set, even without --cross-review), give "
+             "each tool exactly one chance to revise its own work in its own workspace using the review "
+             "written about it (task + its own diff + that review's text - not its own original stdout again, "
+             "to keep the prompt from stacking). Saved as claude_revised_output.txt / claude_revised.diff and "
+             "codex_revised_output.txt / codex_revised.diff. Skipped per-side (with a _SKIPPED.txt) if that "
+             "tool's primary run failed or the review of it wasn't produced. Still no merge, scoring, or "
+             "winner - a third round of files to read, nothing more. Off by default.",
+    )
     args = parser.parse_args()
 
-    task = args.task or input("Task description: ").strip()
+    task = read_task(args)
     if not task:
         print("No task description given.", file=sys.stderr)
         sys.exit(1)
@@ -282,26 +357,46 @@ def main():
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     outputs_dir = Path(args.outputs_dir).resolve()
+
+    if outputs_dir == target or target in outputs_dir.parents:
+        # run_root (outputs_dir/timestamp) would land inside target, so the
+        # copytree below would be copying target into a subdirectory of
+        # itself - shutil.copytree has no protection against that, and it
+        # can balloon disk usage badly (confirmed: this happened for real).
+        print(
+            f"Refusing to run: --outputs-dir ({outputs_dir}) is inside or equal to the target "
+            f"directory ({target}). This would copy the target into a subdirectory of itself. "
+            "Point --outputs-dir somewhere outside the target (e.g. run from a different folder, "
+            "or pass an explicit --outputs-dir path elsewhere).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     run_root = outputs_dir / timestamp
     run_root.mkdir(parents=True, exist_ok=True)
 
     repo_mode = is_git_repo(target)
 
-    claude_cmd = [CLAUDE_BIN, "-p", task, "--output-format", "text"]
+    claude_cmd = [CLAUDE_BIN, "-p", "--output-format", "text"]
     claude_cmd += ["--dangerously-skip-permissions"] if args.yolo else ["--permission-mode", "acceptEdits"]
 
-    codex_cmd = [CODEX_BIN, "exec", task, "--skip-git-repo-check"]
+    codex_cmd = [CODEX_BIN, "exec", "-", "--skip-git-repo-check"]
     codex_cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
 
     jobs = []
-    if claude_path:
-        ws = run_root / "claude_workspace"
-        shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
-        jobs.append(("claude", claude_cmd, ws))
-    if codex_path:
-        ws = run_root / "codex_workspace"
-        shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
-        jobs.append(("codex", codex_cmd, ws))
+    try:
+        if claude_path:
+            ws = run_root / "claude_workspace"
+            shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
+            jobs.append(("claude", claude_cmd, ws))
+        if codex_path:
+            ws = run_root / "codex_workspace"
+            shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
+            jobs.append(("codex", codex_cmd, ws))
+    except OSError as e:
+        print(f"Failed to copy target directory into a disposable workspace: {e}", file=sys.stderr)
+        print("No CLI has been run yet - nothing to clean up beyond the partial copy above.", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Task: {task}")
     print(f"Target directory: {target}")
@@ -310,7 +405,7 @@ def main():
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {pool.submit(run_tool, name, cmd, ws, args.timeout): name for name, cmd, ws in jobs}
+        futures = {pool.submit(run_tool, name, cmd, ws, args.timeout, task): name for name, cmd, ws in jobs}
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             results[result["name"]] = result
@@ -351,8 +446,11 @@ def main():
         print(f"status: {s['status']}")
         print(f"error: {s['error']}")
 
-    if args.cross_review:
-        print("\nCross-review requested (--cross-review): read-only, no file edits, no merging/scoring/winner.")
+    cross_review_enabled = args.cross_review or args.revise
+    reviews = {}  # review_name -> {"result", "reviewer", "reviewed"} - kept around for --revise
+    if cross_review_enabled:
+        why = "--cross-review" if args.cross_review else "--revise (implies cross-review)"
+        print(f"\nCross-review requested ({why}): read-only, no file edits, no merging/scoring/winner.")
         review_specs = []
         for reviewer, reviewed in (("claude", "codex"), ("codex", "claude")):
             review_name = f"{reviewer}_review_of_{reviewed}"
@@ -378,7 +476,6 @@ def main():
             review_specs.append((review_name, reviewer, reviewed))
 
         if review_specs:
-            review_results = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(review_specs)) as pool:
                 futures = {}
                 for review_name, reviewer, reviewed in review_specs:
@@ -392,12 +489,12 @@ def main():
                 for fut in concurrent.futures.as_completed(futures):
                     review_name, reviewer, reviewed, prompt = futures[fut]
                     r = fut.result()
-                    review_results[review_name] = (r, reviewer, reviewed, prompt)
+                    reviews[review_name] = {"result": r, "reviewer": reviewer, "reviewed": reviewed, "prompt": prompt}
 
             for review_name, reviewer, reviewed in review_specs:
-                r, _, _, prompt = review_results[review_name]
+                r = reviews[review_name]["result"]
                 review_path = run_root / f"{review_name}.txt"
-                write_review_file(review_path, reviewer, reviewed, prompt, r)
+                write_review_file(review_path, reviewer, reviewed, reviews[review_name]["prompt"], r)
                 print(f"\n=== {review_name} ===")
                 print(f"status: {r['status']}" + (f" (exit {r['returncode']})" if r["returncode"] is not None else ""))
                 print(f"duration: {r['duration']:.2f}s")
@@ -407,11 +504,78 @@ def main():
                 if r["status"] != "ok":
                     any_failure = True
 
+    if args.revise:
+        print("\nRevision requested (--revise): each tool gets one chance to revise its own work using the "
+              "review written about it. Still no merge/scoring/winner.")
+        revise_cmds = {"claude": claude_cmd, "codex": codex_cmd}
+        revise_specs = []
+        for name in ("claude", "codex"):
+            other = "codex" if name == "claude" else "claude"
+            review_name = f"{other}_review_of_{name}"
+            revision_name = f"{name}_revised"
+
+            if name not in primary or primary[name]["result"]["status"] != "ok":
+                skip_reason = f"'{name}' primary run did not complete successfully - nothing to revise"
+            elif review_name not in reviews or reviews[review_name]["result"]["status"] != "ok":
+                skip_reason = f"'{review_name}' is not available (skipped or failed) - nothing to revise from"
+            else:
+                skip_reason = None
+
+            if skip_reason:
+                skip_path = run_root / f"{revision_name}_SKIPPED.txt"
+                skip_path.write_text(f"Revision skipped.\nReason: {skip_reason}\n", encoding="utf-8")
+                print(f"\n=== {revision_name} ===")
+                print(f"skipped: {skip_reason}")
+                print(f"recorded to: {skip_path}")
+                continue
+
+            revise_specs.append((revision_name, name, review_name))
+
+        if revise_specs:
+            revise_results = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(revise_specs)) as pool:
+                futures = {}
+                for revision_name, name, review_name in revise_specs:
+                    prompt = build_revision_prompt(
+                        task, primary[name]["diff_text"], reviews[review_name]["result"]["stdout"]
+                    )
+                    cmd = revise_cmds[name]
+                    cwd = primary[name]["ws"]
+                    fut = pool.submit(run_tool, revision_name, cmd, cwd, args.timeout, prompt)
+                    futures[fut] = (revision_name, name)
+                for fut in concurrent.futures.as_completed(futures):
+                    revision_name, name = futures[fut]
+                    r = fut.result()
+                    revise_results[revision_name] = (r, name)
+
+            for revision_name, name, review_name in revise_specs:
+                r, _ = revise_results[revision_name]
+                diff_text = get_diff(primary[name]["ws"]) if repo_mode else None
+
+                output_path = run_root / f"{revision_name}_output.txt"
+                write_output_file(output_path, r, diff_text)
+
+                diff_path = None
+                if diff_text is not None:
+                    diff_path = run_root / f"{revision_name}.diff"
+                    diff_path.write_text(diff_text, encoding="utf-8")
+
+                print_summary(r, output_path, diff_path)
+                if diff_text:
+                    print(f"--- {revision_name} diff (cumulative: original attempt + revision) ---")
+                    print(diff_text)
+                elif repo_mode:
+                    print(f"({revision_name} made no additional file changes)")
+
+                if r["status"] != "ok":
+                    any_failure = True
+
     if args.no_keep_workspaces:
         for name in primary:
             shutil.rmtree(primary[name]["ws"], ignore_errors=True)
 
     print(f"\nAll results saved under: {run_root}")
+    print_output_guide(run_root, primary, cross_review_enabled, args.revise)
     print("No merge, no scoring, no decision made - review both outputs/diffs yourself.")
 
     sys.exit(1 if any_failure else 0)
