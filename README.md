@@ -66,3 +66,28 @@ Each run may include:
 The original target directory is copied before either tool runs, so the script does not directly modify the target.
 
 The task is piped to both CLIs via stdin, which keeps multi-line prompts from getting mangled by Windows command-line quoting.
+
+## GUI
+
+Launch the desktop wrapper with:
+
+```powershell
+.\launch_gui.cmd
+```
+
+Or directly:
+
+```powershell
+C:\Users\Rebel\.local\bin\python3.12.exe .\claudexgpt_gui.py
+```
+
+The GUI is a small Tkinter control panel around `claudexgpt.py`.
+
+- Pick a target folder.
+- Paste a task.
+- Choose `Cross-review`, `Revise once`, `Keep workspaces`, or `Yolo`.
+- Run and watch the CLI output stream live.
+- Open the latest output folder.
+- Apply a chosen saved diff through the Apply tab.
+
+The theme uses Claude orange/gray on one side, GPT black/white on the other, and a green wireframe bridge in the middle.

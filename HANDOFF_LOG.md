@@ -357,3 +357,33 @@ Result: compiled clean.
 6. Full real-workflow regression: ran a normal (no `--apply`) pass with a real Claude call and a zero-API-call Codex stub (`exit /b 0`, never contacts the API) against a throwaway repo - output set identical to before Phase 4, confirming the new argparse options didn't break the normal path. Then applied the real `claude.diff` produced by that run to the same repo with `--apply` - worked end to end, file landed with the exact content Claude wrote.
 
 Not yet committed/pushed. Nothing here required Codex - the constraint noted above is still in effect and wasn't touched.
+
+### 2026-08-11 (local) - GUI wrapper started
+
+Marked by: Cody/Codex
+
+What I changed:
+
+- Added `claudexgpt_gui.py`, a Tkinter desktop wrapper around `claudexgpt.py`.
+- Added `launch_gui.cmd`, which launches the GUI with `C:\Users\Rebel\.local\bin\python3.12.exe`.
+- Updated README with GUI launch instructions.
+
+Why:
+
+- The user asked for the GUI after choosing the visual theme: Claude orange/gray, GPT black/white, green wireframe middle.
+- The `D:\Tools\Python\3.14.7` embeddable Python can run the CLI but does not include Tkinter, so the launcher uses the existing `uv`-managed Python 3.12 that does include Tkinter.
+
+Current GUI behavior:
+
+- Run tab: target picker, outputs picker, multiline task box, cross-review/revise/yolo/keep-workspaces toggles, timeout, live output log, latest-output opener.
+- Apply tab: run-dir picker, target picker, saved-diff choice, GUI confirmation dialog, then invokes CLI `--apply ... --yes` so the subprocess does not hang on an invisible prompt.
+- It does not reimplement the agent orchestration; it shells out to the CLI.
+
+Verification:
+
+- `C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py claudexgpt.py` passed.
+- Tk smoke check passed: imported `claudexgpt_gui`, instantiated `ClaudeCGptGui`, called `update()`, printed the window title, and destroyed it.
+
+Still open:
+
+- Full manual GUI run through both agents was not performed from the GUI itself, to avoid spending more agent/API quota. The GUI invokes the already-tested CLI path.
