@@ -120,6 +120,22 @@ Why:
 - The project script is Python, and the previous default `python` command was only resolving to the Windows Store alias.
 - The user asked to install Python somewhere other than `C:\` and make sure it is on `PATH`.
 
+### 2026-08-11 (local)
+
+Marked by: Claude/VS Code
+
+Starting Phase 2: optional `--cross-review` mode.
+
+What I intend to change in `claudexgpt.py`:
+
+- Add a `--cross-review` CLI flag, off by default. Default (no-flag) behavior must stay byte-for-byte identical to Phase 1 — no changes to the existing primary-run code path.
+- When enabled, after both primary runs complete: have Claude review Codex's result and Codex review Claude's result, each review including the original task, the other tool's stdout/stderr/status, and its git diff (if available).
+- Reviews will be read-only by construction, not just by prompt instruction: Claude's review call uses `--tools ""` (disables all tools), Codex's uses `-s read-only`. Just verified both directly — asked each to create a file under these flags and confirmed via `git status --porcelain` that nothing was written.
+- Review prompts will be passed via stdin (`codex exec -` / `claude -p` with no positional arg), not as a CLI argument — verified this works for multi-line input on both. Passing a multi-line prompt as a literal argv element would go through `cmd.exe` (needed for the `.cmd` shims) which mishandles embedded newlines; stdin avoids that risk entirely for these prompts.
+- Saved as `claude_review_of_codex.txt` / `codex_review_of_claude.txt` in the same timestamped run directory as the primary outputs.
+- If the tool being reviewed is missing or didn't complete successfully (status != "ok"), or the reviewing tool itself is missing, that side of the cross-review is skipped with a `_SKIPPED.txt` marker recording why — no partial/misleading review file gets written.
+- No auto-merge, no scoring, no winner logic added anywhere.
+
 ## Coordination Rule
 
 Before editing `claudexgpt.py`, read this file and append a new dated note describing:
@@ -159,3 +175,36 @@ Still blocked:
 
 - Git is authenticated as a GitHub account that does not have write access to `silverhand-ai/ClaudeCGpt`.
 - Retry `git push -u origin main` after authenticating git/GitHub CLI/browser credentials as an account with permission to that repository.
+
+### 2026-08-11 (local) - Phase 2 complete
+
+Marked by: Claude/VS Code
+
+What I changed in `claudexgpt.py`:
+
+- Added `--cross-review` flag (off by default). Verified the default (no-flag) path is byte-identical in behavior to Phase 1: same files written, no cross-review section printed, exit code 0, using the real CLIs (not a simulation).
+- `run_tool()` now takes an optional `stdin_input` param (default `None`, so all existing Phase 1 call sites are unaffected). When set, the prompt is piped via stdin instead of being an argv element.
+- New functions: `build_review_prompt()`, `build_reviewer_cmd()`, `write_review_file()`.
+- When `--cross-review` is set, after both primary runs finish: Claude reviews Codex's result and Codex reviews Claude's, each saved to `claude_review_of_codex.txt` / `codex_review_of_claude.txt` in the same run directory.
+- Review calls are hardcoded read-only regardless of `--yolo`: `claude -p --tools ""` (all tools disabled) and `codex exec -s read-only`. Verified directly (see previous entry) that both refuse to write a file under these flags.
+- Review prompts go in via stdin (`input=` to `subprocess.run`), not as a CLI arg, to avoid `cmd.exe` mangling the multi-line prompt text (cmd.exe is the required intermediary for the npm `.cmd` shims on Windows via `shell=True`).
+- Skip logic: a review is skipped (with a `<name>_SKIPPED.txt` marker recording the reason) if the tool being reviewed is missing or didn't finish with status `ok`, or if the reviewing tool itself is missing. If the reviewing tool IS installed but fails at call time (e.g. auth/API error), that's not pre-empted — it's attempted and the failure is captured in the normal `status: failed` review file, same as any other tool failure elsewhere in this script. Confirmed this distinction with a forced-failure test (see below).
+- Workspace cleanup (`--no-keep-workspaces`) now happens after cross-review instead of immediately after each primary run, since review needs the workspace dir as `cwd`.
+
+Verification:
+
+```powershell
+python -m py_compile claudexgpt.py
+```
+Result: compiled clean, no errors.
+
+Smoke tests (throwaway git repos in a temp scratch dir, not this project folder):
+1. `--cross-review` against a real 2-tool run: both primary diffs correct, both `claude_review_of_codex.txt` / `codex_review_of_claude.txt` written with sensible review text, prompt included in full in each file for auditability.
+2. Confirmed via `git status --porcelain` in both `claude_workspace/` and `codex_workspace/` that the review calls made zero additional file changes beyond the primary run's own edit.
+3. Forced one primary tool (codex) to fail via a PATH-shadowed stub `codex.cmd` that exits 1: `claude_review_of_codex` correctly skipped with a `_SKIPPED.txt` explaining why (codex, the reviewed tool, didn't complete successfully); `codex_review_of_claude` was still attempted (codex the *reviewer* was "installed", just failing) and correctly captured as `status: failed` with the stub's stderr in the file, no crash.
+4. Re-ran without `--cross-review` (real CLIs): output set and exit code identical to pre-Phase-2 behavior - confirms the default path is unchanged.
+
+Anything still risky/unfinished:
+
+- Cross-review review-prompt construction embeds the *entire* stdout/stderr of the reviewed tool's primary run. For a very large/verbose primary run this could make the review prompt large; no truncation was added (kept minimal per the "small, stdlib-only" constraint) - a real concern only for unusually large tasks.
+- Not addressed (pre-existing, out of scope for Phase 2): Phase 1's own primary task argument is still passed as an argv element through `cmd.exe`, so a user-supplied task description containing embedded newlines could hit the same quoting risk that motivated stdin for review prompts. Only cross-review's own prompts were changed to use stdin.
