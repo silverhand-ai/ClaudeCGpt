@@ -36,14 +36,27 @@ applies an already-saved diff from a past run to the real target directory
 is the only thing in the whole tool that writes to the real target - every
 other mode only ever touches disposable copies. The human already chose by
 picking --apply-which; there is still no auto-merge, scoring, or winner.
+
+Optional --chat <chat_dir>: one turn of a persistent multi-turn conversation
+with both tools, kept alive via claude --resume / codex exec resume (session
+ids stored in <chat_dir>/chat_state.json). If <chat_dir> doesn't exist yet,
+this is turn 1 and -C/--dir must point at the target to copy into fresh
+workspaces there; later turns reuse the same workspaces and -C is ignored.
+The message for the turn is the normal task argument/--task-file/prompt.
+Diffs are refreshed after each turn using the same filenames a normal run
+produces, so a chat directory is fully usable from the GUI's existing
+Compare/Apply tabs (or --apply) without any special-casing.
 """
 
 import argparse
 import concurrent.futures
 import datetime
+import json
+import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 # On Windows, npm installs claude/codex as .cmd shims. subprocess can't
@@ -66,6 +79,14 @@ COPY_IGNORE = shutil.ignore_patterns(
     "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
     ".next", "target", ".mypy_cache", ".pytest_cache",
 )
+
+
+def would_nest_inside(outputs_dir, target):
+    """True if outputs_dir is target itself or a subdirectory of it - copying
+    target into a workspace under outputs_dir would then copy target into a
+    subdirectory of itself. shutil.copytree has no protection against that
+    (confirmed: this happened for real once, see HANDOFF_LOG.md)."""
+    return outputs_dir == target or target in outputs_dir.parents
 
 
 def which_or_none(name):
@@ -385,6 +406,109 @@ def run_apply_mode(args):
     sys.exit(0)
 
 
+CHAT_BEGIN = "###CLAUDEXGPT_CHAT_{}_BEGIN###"
+CHAT_END = "###CLAUDEXGPT_CHAT_{}_END###"
+
+
+def run_chat_mode(args, message):
+    """One turn of a persistent conversation. Each call is a normal one-shot
+    subprocess invocation, same as every other mode here - the "conversation"
+    is just claude --resume / codex exec resume threading context through
+    session ids saved to disk between calls, not a long-lived process."""
+    chat_dir = Path(args.chat).resolve()
+    state_path = chat_dir / "chat_state.json"
+    claude_ws = chat_dir / "claude_workspace"
+    codex_ws = chat_dir / "codex_workspace"
+
+    if state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    else:
+        target = Path(args.dir).resolve()
+        if not target.is_dir():
+            print(f"Target directory does not exist: {target}", file=sys.stderr)
+            sys.exit(1)
+        if would_nest_inside(chat_dir, target):
+            print(
+                f"Refusing to start: chat directory ({chat_dir}) is inside or equal to the target "
+                f"directory ({target}). Pick a chat directory outside the target.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if which_or_none(CLAUDE_BIN):
+                shutil.copytree(target, claude_ws, ignore=COPY_IGNORE, symlinks=True)
+            if which_or_none(CODEX_BIN):
+                shutil.copytree(target, codex_ws, ignore=COPY_IGNORE, symlinks=True)
+        except OSError as e:
+            print(f"Failed to copy target directory into chat workspace: {e}", file=sys.stderr)
+            sys.exit(1)
+        state = {"claude_session_id": None, "codex_session_id": None, "target": str(target)}
+        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    claude_path = which_or_none(CLAUDE_BIN)
+    codex_path = which_or_none(CODEX_BIN)
+
+    jobs = []
+    if claude_path and claude_ws.is_dir():
+        if state["claude_session_id"]:
+            cmd = [CLAUDE_BIN, "-p", "--resume", state["claude_session_id"], "--output-format", "text"]
+        else:
+            state["claude_session_id"] = str(uuid.uuid4())
+            cmd = [CLAUDE_BIN, "-p", "--session-id", state["claude_session_id"], "--output-format", "text"]
+        cmd += ["--dangerously-skip-permissions"] if args.yolo else ["--permission-mode", "acceptEdits"]
+        jobs.append(("claude", cmd, claude_ws))
+    if codex_path and codex_ws.is_dir():
+        if state["codex_session_id"]:
+            cmd = [CODEX_BIN, "exec", "resume", state["codex_session_id"], "-", "--skip-git-repo-check"]
+        else:
+            cmd = [CODEX_BIN, "exec", "-", "--skip-git-repo-check"]
+        cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
+        jobs.append(("codex", cmd, codex_ws))
+
+    if not jobs:
+        print("Neither CLI has a workspace in this chat directory - nothing to send to.", file=sys.stderr)
+        sys.exit(1)
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {pool.submit(run_tool, name, cmd, ws, args.timeout, message): name for name, cmd, ws in jobs}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results[result["name"]] = result
+
+    # Codex has no equivalent of claude's --session-id to set one upfront -
+    # it always auto-generates one and prints it to stderr, so the first
+    # successful turn is when we learn it for later --resume calls.
+    if "codex" in results and not state.get("codex_session_id"):
+        m = re.search(r"session id:\s*([0-9a-fA-F-]+)", results["codex"].get("stderr") or "")
+        if m:
+            state["codex_session_id"] = m.group(1)
+
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    for name, ws in (("claude", claude_ws), ("codex", codex_ws)):
+        if name in results and ws.is_dir() and is_git_repo(ws):
+            (chat_dir / f"{name}.diff").write_text(get_diff(ws), encoding="utf-8")
+
+    for name in ("claude", "codex"):
+        print(CHAT_BEGIN.format(name.upper()))
+        if name in results:
+            r = results[name]
+            print(f"status: {r['status']}" + (f" (exit {r['returncode']})" if r["returncode"] is not None else ""))
+            if r["error"]:
+                print(f"error: {r['error']}")
+            print(r["stdout"] or "(empty)")
+            if r["status"] != "ok" and r["stderr"]:
+                print("--- stderr ---")
+                print(r["stderr"])
+        else:
+            print("(not available in this chat)")
+        print(CHAT_END.format(name.upper()))
+
+    sys.exit(0 if all(r["status"] == "ok" for r in results.values()) else 1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="claudexgpt",
@@ -416,6 +540,17 @@ def main():
     parser.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt for --apply. Has no effect otherwise.",
+    )
+    parser.add_argument(
+        "--chat", metavar="CHAT_DIR",
+        help="Send one turn of a persistent conversation with both tools, instead of a one-shot run. "
+             "CHAT_DIR stores the conversation's state and workspaces. If it doesn't exist yet, this is "
+             "turn 1 and -C/--dir must point at the target to copy in; later turns to the same CHAT_DIR "
+             "reuse the existing workspaces and ignore -C. The message is the normal task argument / "
+             "--task-file / prompt. Context is preserved per-tool (claude --resume, codex exec resume). "
+             "Diffs refresh after each turn using the normal claude.diff/codex.diff filenames, so a chat "
+             "directory works with --apply and the GUI's Compare/Apply tabs without any special-casing. "
+             "Ignores --cross-review/--revise/--no-keep-workspaces.",
     )
     parser.add_argument(
         "--outputs-dir", default=DEFAULT_OUTPUTS_DIR,
@@ -464,6 +599,13 @@ def main():
         print("No task description given.", file=sys.stderr)
         sys.exit(1)
 
+    if args.chat:
+        # Target validation for --chat is conditional (only required for a
+        # brand-new chat directory), so it's handled inside run_chat_mode
+        # rather than by the general target check right below this.
+        run_chat_mode(args, task)
+        return
+
     target = Path(args.dir).resolve()
     if not target.is_dir():
         print(f"Target directory does not exist: {target}", file=sys.stderr)
@@ -483,11 +625,7 @@ def main():
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     outputs_dir = Path(args.outputs_dir).resolve()
 
-    if outputs_dir == target or target in outputs_dir.parents:
-        # run_root (outputs_dir/timestamp) would land inside target, so the
-        # copytree below would be copying target into a subdirectory of
-        # itself - shutil.copytree has no protection against that, and it
-        # can balloon disk usage badly (confirmed: this happened for real).
+    if would_nest_inside(outputs_dir, target):
         print(
             f"Refusing to run: --outputs-dir ({outputs_dir}) is inside or equal to the target "
             f"directory ({target}). This would copy the target into a subdirectory of itself. "
