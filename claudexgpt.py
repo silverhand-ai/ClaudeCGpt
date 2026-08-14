@@ -52,6 +52,7 @@ import argparse
 import concurrent.futures
 import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -354,7 +355,7 @@ def run_apply_mode(args):
         print(f"{diff_path.name} is empty - '{args.apply_which}' made no changes in that run. Nothing to apply.")
         sys.exit(0)
 
-    target = Path(args.dir).resolve()
+    target = Path(args.dir or ".").resolve()
     if not target.is_dir():
         print(f"Target directory does not exist: {target}", file=sys.stderr)
         sys.exit(1)
@@ -409,12 +410,29 @@ def run_apply_mode(args):
 CHAT_BEGIN = "###CLAUDEXGPT_CHAT_{}_BEGIN###"
 CHAT_END = "###CLAUDEXGPT_CHAT_{}_END###"
 
+OTHER_NAME = {"claude": "Codex/GPT", "codex": "Claude"}
+
+
+def build_crosstalk_message(human_message, other_display_name, other_reply):
+    """Wrap the human's message with what the other AI most recently said, so
+    each side is actually responding to a real 3-way conversation instead of
+    two independent one-on-one chats with the same human."""
+    if not other_reply:
+        return human_message
+    return (
+        f"[{other_display_name} just said, in our shared 3-way conversation]:\n{other_reply.strip()}\n\n"
+        f"[Now responding to the human, who said]:\n{human_message}"
+    )
+
 
 def run_chat_mode(args, message):
-    """One turn of a persistent conversation. Each call is a normal one-shot
-    subprocess invocation, same as every other mode here - the "conversation"
-    is just claude --resume / codex exec resume threading context through
-    session ids saved to disk between calls, not a long-lived process."""
+    """One turn of a persistent 3-way conversation. Each call is still a
+    normal one-shot subprocess invocation, same as every other mode here -
+    the "conversation" is session ids threaded through claude --resume /
+    codex exec resume, plus each side's last reply carried forward so the
+    other side can actually respond to it. Turns are sequential (not
+    parallel): whoever goes second in a round sees what the first one just
+    said this round; whoever goes first sees what the other said last round."""
     chat_dir = Path(args.chat).resolve()
     state_path = chat_dir / "chat_state.json"
     claude_ws = chat_dir / "claude_workspace"
@@ -423,67 +441,94 @@ def run_chat_mode(args, message):
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
     else:
-        target = Path(args.dir).resolve()
-        if not target.is_dir():
-            print(f"Target directory does not exist: {target}", file=sys.stderr)
-            sys.exit(1)
-        if would_nest_inside(chat_dir, target):
-            print(
-                f"Refusing to start: chat directory ({chat_dir}) is inside or equal to the target "
-                f"directory ({target}). Pick a chat directory outside the target.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        target = Path(args.dir).resolve() if args.dir else None
+        if target is not None:
+            if not target.is_dir():
+                print(f"Target directory does not exist: {target}", file=sys.stderr)
+                sys.exit(1)
+            if would_nest_inside(chat_dir, target):
+                print(
+                    f"Refusing to start: chat directory ({chat_dir}) is inside or equal to the target "
+                    f"directory ({target}). Pick a chat directory outside the target.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         chat_dir.mkdir(parents=True, exist_ok=True)
         try:
-            if which_or_none(CLAUDE_BIN):
-                shutil.copytree(target, claude_ws, ignore=COPY_IGNORE, symlinks=True)
-            if which_or_none(CODEX_BIN):
-                shutil.copytree(target, codex_ws, ignore=COPY_IGNORE, symlinks=True)
+            for bin_name, ws in ((CLAUDE_BIN, claude_ws), (CODEX_BIN, codex_ws)):
+                if not which_or_none(bin_name):
+                    continue
+                if target is not None:
+                    shutil.copytree(target, ws, ignore=COPY_IGNORE, symlinks=True)
+                else:
+                    # No target - pure conversation. Still git-init an empty
+                    # workspace so get_diff()/is_git_repo() work unmodified
+                    # if either side happens to write a file mid-conversation.
+                    ws.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(["git", "init", "-q", str(ws)], capture_output=True, timeout=15)
+                    git_env = {
+                        **os.environ,
+                        "GIT_AUTHOR_NAME": "claudexgpt", "GIT_AUTHOR_EMAIL": "claudexgpt@localhost",
+                        "GIT_COMMITTER_NAME": "claudexgpt", "GIT_COMMITTER_EMAIL": "claudexgpt@localhost",
+                    }
+                    subprocess.run(
+                        ["git", "-C", str(ws), "commit", "--allow-empty", "-q", "-m", "chat start"],
+                        capture_output=True, timeout=15, env=git_env,
+                    )
         except OSError as e:
-            print(f"Failed to copy target directory into chat workspace: {e}", file=sys.stderr)
+            print(f"Failed to set up chat workspace: {e}", file=sys.stderr)
             sys.exit(1)
-        state = {"claude_session_id": None, "codex_session_id": None, "target": str(target)}
+        state = {
+            "claude_session_id": None, "codex_session_id": None,
+            "last_claude_reply": None, "last_codex_reply": None,
+            "target": str(target) if target else None,
+        }
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     claude_path = which_or_none(CLAUDE_BIN)
     codex_path = which_or_none(CODEX_BIN)
-
-    jobs = []
-    if claude_path and claude_ws.is_dir():
-        if state["claude_session_id"]:
-            cmd = [CLAUDE_BIN, "-p", "--resume", state["claude_session_id"], "--output-format", "text"]
-        else:
-            state["claude_session_id"] = str(uuid.uuid4())
-            cmd = [CLAUDE_BIN, "-p", "--session-id", state["claude_session_id"], "--output-format", "text"]
-        cmd += ["--dangerously-skip-permissions"] if args.yolo else ["--permission-mode", "acceptEdits"]
-        jobs.append(("claude", cmd, claude_ws))
-    if codex_path and codex_ws.is_dir():
-        if state["codex_session_id"]:
-            cmd = [CODEX_BIN, "exec", "resume", state["codex_session_id"], "-", "--skip-git-repo-check"]
-        else:
-            cmd = [CODEX_BIN, "exec", "-", "--skip-git-repo-check"]
-        cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
-        jobs.append(("codex", cmd, codex_ws))
-
-    if not jobs:
+    available = [n for n, p, ws in (("claude", claude_path, claude_ws), ("codex", codex_path, codex_ws)) if p and ws.is_dir()]
+    if not available:
         print("Neither CLI has a workspace in this chat directory - nothing to send to.", file=sys.stderr)
         sys.exit(1)
 
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {pool.submit(run_tool, name, cmd, ws, args.timeout, message): name for name, cmd, ws in jobs}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            results[result["name"]] = result
+    first = args.chat_first if args.chat_first in available else available[0]
+    order = [first] + [n for n in available if n != first]
 
-    # Codex has no equivalent of claude's --session-id to set one upfront -
-    # it always auto-generates one and prints it to stderr, so the first
-    # successful turn is when we learn it for later --resume calls.
-    if "codex" in results and not state.get("codex_session_id"):
-        m = re.search(r"session id:\s*([0-9a-fA-F-]+)", results["codex"].get("stderr") or "")
-        if m:
-            state["codex_session_id"] = m.group(1)
+    def build_cmd(name):
+        ws = claude_ws if name == "claude" else codex_ws
+        if name == "claude":
+            if state["claude_session_id"]:
+                cmd = [CLAUDE_BIN, "-p", "--resume", state["claude_session_id"], "--output-format", "text"]
+            else:
+                state["claude_session_id"] = str(uuid.uuid4())
+                cmd = [CLAUDE_BIN, "-p", "--session-id", state["claude_session_id"], "--output-format", "text"]
+            cmd += ["--dangerously-skip-permissions"] if args.yolo else ["--permission-mode", "acceptEdits"]
+        else:
+            if state["codex_session_id"]:
+                cmd = [CODEX_BIN, "exec", "resume", state["codex_session_id"], "-", "--skip-git-repo-check"]
+            else:
+                cmd = [CODEX_BIN, "exec", "-", "--skip-git-repo-check"]
+            cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
+        return cmd, ws
+
+    results = {}
+    for name in order:
+        other = "codex" if name == "claude" else "claude"
+        other_reply = results[other]["stdout"] if other in results else state.get(f"last_{other}_reply")
+        turn_message = build_crosstalk_message(message, OTHER_NAME[name], other_reply)
+
+        cmd, ws = build_cmd(name)
+        result = run_tool(name, cmd, ws, args.timeout, turn_message)
+        results[name] = result
+
+        if name == "codex" and not state.get("codex_session_id"):
+            m = re.search(r"session id:\s*([0-9a-fA-F-]+)", result.get("stderr") or "")
+            if m:
+                state["codex_session_id"] = m.group(1)
+
+        if result["status"] == "ok":
+            state[f"last_{name}_reply"] = result["stdout"]
 
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -491,19 +536,16 @@ def run_chat_mode(args, message):
         if name in results and ws.is_dir() and is_git_repo(ws):
             (chat_dir / f"{name}.diff").write_text(get_diff(ws), encoding="utf-8")
 
-    for name in ("claude", "codex"):
+    for name in order:
         print(CHAT_BEGIN.format(name.upper()))
-        if name in results:
-            r = results[name]
-            print(f"status: {r['status']}" + (f" (exit {r['returncode']})" if r["returncode"] is not None else ""))
-            if r["error"]:
-                print(f"error: {r['error']}")
-            print(r["stdout"] or "(empty)")
-            if r["status"] != "ok" and r["stderr"]:
-                print("--- stderr ---")
-                print(r["stderr"])
-        else:
-            print("(not available in this chat)")
+        r = results[name]
+        print(f"status: {r['status']}" + (f" (exit {r['returncode']})" if r["returncode"] is not None else ""))
+        if r["error"]:
+            print(f"error: {r['error']}")
+        print(r["stdout"] or "(empty)")
+        if r["status"] != "ok" and r["stderr"]:
+            print("--- stderr ---")
+            print(r["stderr"])
         print(CHAT_END.format(name.upper()))
 
     sys.exit(0 if all(r["status"] == "ok" for r in results.values()) else 1)
@@ -520,9 +562,12 @@ def main():
         help="Read the task description from a UTF-8 text file. Useful for multi-line prompts.",
     )
     parser.add_argument(
-        "-C", "--dir", default=".",
-        help="Target directory to work in (default: current directory). With --apply, this is the real "
-             "directory the chosen diff gets applied to.",
+        "-C", "--dir", default=None,
+        help="Target directory to work in (default: current directory, except with --chat starting a "
+             "new conversation - there, omitting this means a target-free conversation with no files "
+             "copied in, since -C's usual '.' default would otherwise silently mean 'copy whatever "
+             "directory the process happens to be running in', which has bitten this project before). "
+             "With --apply, this is the real directory the chosen diff gets applied to.",
     )
     parser.add_argument(
         "--apply", metavar="RUN_DIR",
@@ -543,14 +588,24 @@ def main():
     )
     parser.add_argument(
         "--chat", metavar="CHAT_DIR",
-        help="Send one turn of a persistent conversation with both tools, instead of a one-shot run. "
-             "CHAT_DIR stores the conversation's state and workspaces. If it doesn't exist yet, this is "
-             "turn 1 and -C/--dir must point at the target to copy in; later turns to the same CHAT_DIR "
-             "reuse the existing workspaces and ignore -C. The message is the normal task argument / "
-             "--task-file / prompt. Context is preserved per-tool (claude --resume, codex exec resume). "
-             "Diffs refresh after each turn using the normal claude.diff/codex.diff filenames, so a chat "
-             "directory works with --apply and the GUI's Compare/Apply tabs without any special-casing. "
-             "Ignores --cross-review/--revise/--no-keep-workspaces.",
+        help="Send one turn of a persistent 3-way conversation (you, claude, codex), instead of a "
+             "one-shot run. CHAT_DIR stores the conversation's state and workspaces. If it doesn't exist "
+             "yet, this is turn 1; pass -C/--dir if you want the conversation to happen inside a copy of "
+             "a real project (files can then be read/edited as part of the conversation), or omit -C for "
+             "a target-free conversation with nothing copied in. Later turns to the same CHAT_DIR reuse "
+             "whatever was set up on turn 1 and ignore -C. The message is the normal task argument / "
+             "--task-file / prompt. Turns are sequential, not parallel - whichever tool goes second in a "
+             "round is shown what the first one just said (see --chat-first), and each side carries the "
+             "other's latest reply forward turn to turn via claude --resume / codex exec resume, so they "
+             "are genuinely responding to each other, not just independently to you. Diffs refresh after "
+             "each turn using the normal claude.diff/codex.diff filenames, so a chat directory works with "
+             "--apply and the GUI's Compare/Apply tabs without any special-casing. Ignores "
+             "--cross-review/--revise/--no-keep-workspaces.",
+    )
+    parser.add_argument(
+        "--chat-first", choices=("claude", "codex"), default="codex",
+        help="Which tool responds first in each --chat round (default: codex). The other one then sees "
+             "what it just said before replying.",
     )
     parser.add_argument(
         "--outputs-dir", default=DEFAULT_OUTPUTS_DIR,
@@ -606,7 +661,7 @@ def main():
         run_chat_mode(args, task)
         return
 
-    target = Path(args.dir).resolve()
+    target = Path(args.dir or ".").resolve()
     if not target.is_dir():
         print(f"Target directory does not exist: {target}", file=sys.stderr)
         sys.exit(1)

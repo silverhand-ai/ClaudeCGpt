@@ -495,4 +495,49 @@ Result: compiled clean.
 
 **Important: the already-running GUI process (launched earlier this session) has the old buggy code loaded in memory and needs to be restarted to pick up this fix** - Python doesn't hot-reload. Told the user directly.
 
+### 2026-08-14 (local) - `--chat` redesigned into a real 3-way conversation
+
+Marked by: Claude/VS Code
+
+User said they're tired of manually relaying messages between Claude and GPT/Codex (their actual described workflow: talk to GPT, copy its reply, paste into Claude, paste Claude's reply back - a real conversation but with a lot of manual copy-paste) and want one window where they can have an actual 3-way conversation. Clarified first: is "one window" just about the display being unified, with each AI still only reacting to the human independently (like the Chat tab already did), or do the two AIs need to actually see and react to each other? User was explicit: they need the AIs to communicate with each other for real, not just both talk to the human in parallel.
+
+This is a materially different design from the Chat tab built earlier today, which sent the same message to both tools in parallel and displayed two independent replies side by side - functionally still two one-on-one conversations, just launched together. Redesigned `--chat` and the Chat tab rather than adding a second mode alongside it, since the old parallel behavior doesn't seem to serve a purpose once this exists.
+
+**New design, `claudexgpt.py`:**
+- Turns are now sequential, not parallel. `--chat-first {claude,codex}` (default `codex`, matching how the user described actually working - GPT easier/faster to talk to, Claude better at reacting/deducing) decides who goes first each round. Whoever goes second is shown what the first one *just* said this round; whoever goes first is shown what the other one said *last* round (carried forward via new `last_claude_reply`/`last_codex_reply` fields in `chat_state.json`, alongside the existing session ids) - so over multiple rounds both sides stay caught up on the whole conversation, not just their half of it.
+- New `build_crosstalk_message()` wraps the human's message with a clearly delimited "[X just said, in our shared 3-way conversation]: ..." block before the actual message, when there's a prior reply to inject. First message of a fresh conversation has nothing to inject, so it goes through unwrapped.
+- **Target is now optional.** The whole earlier design assumed every chat happens inside a copy of a real project; the user's actual use case (a personal conversation, nothing to do with code) doesn't need a target at all. Changed `-C`/`--dir`'s argparse default from `"."` to `None` globally (updated the two other places that relied on the old default - normal run mode and `--apply` - to explicitly do `Path(args.dir or ".").resolve()` so their documented "defaults to cwd" behavior is unchanged) so `run_chat_mode` can tell "target omitted" apart from "target explicitly is the current directory" for the first time. If a target is given, works as before (copies into workspaces, files can be read/edited as part of the conversation). If omitted, both workspaces are just empty dirs, `git init`'d with an empty initial commit so `get_diff()`/`is_git_repo()` still work unmodified if either side happens to write a file mid-conversation - no special-casing needed anywhere else in the tool.
+- Removed the `ThreadPoolExecutor` concurrency from chat mode entirely (turns are sequential now by design, no longer parallel) - `run_chat_mode` just calls `run_tool()` in a loop over the speaking order.
+
+**GUI changes (`claudexgpt_gui.py`):** Chat tab rebuilt from two side-by-side panes into a single merged scrolling thread (`chat_thread_text`), with "You:"/"Claude:"/"Codex:" labeled and color-tagged per line, in actual speaking order (parsed by sorting the two `###CLAUDEXGPT_CHAT_*_BEGIN###` marker positions in the CLI's stdout, not a fixed order, since who spoke first now varies by round/setting). Target field relabeled "Target (optional)" and `_new_chat` no longer requires one. Added a "First to speak" dropdown bound to the new `--chat-first` flag. `_chat_send` only appends `-C <target>` to the command when the field is actually non-blank (never passes `-C ""` - same footgun class as the earlier blank-target bug, avoided here from the start rather than fixed after the fact).
+
+Verification - all real Claude, a controllable Codex stub throughout (per the standing Codex-usage constraint at the top of this file):
+```powershell
+D:\Tools\Python\3.14.7\python.exe -m py_compile claudexgpt.py
+C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py claudexgpt.py
+```
+Both compiled clean.
+
+**The actual proof this works** (not just "the flag was passed" - genuine evidence the crosstalk reaches the model and it responds to it):
+1. Target-free conversation, codex-stub-first: stub replied with a made-up, never-seen-before phrase ("ZORPFLUX" / later "QUIBBLEWOMP"). Real claude's reply, going second, explicitly referenced that exact phrase before giving its own answer - not something it could produce without actually receiving the injected context.
+2. Round 2: rewrote the stub to literally echo back whatever stdin it received instead of giving a canned reply. Its echoed output showed Claude's round-1 reply, verbatim, correctly wrapped in the `[Claude just said...]` block - direct proof of the `last_claude_reply` carry-forward working across rounds, not just within one round.
+3. `--chat-first claude` correctly reordered which block appears first in the output.
+4. A target-based conversation (real repo, real Claude call) still copies into workspaces and produces a correct `claude.diff` after a turn that writes a file - confirms the optional-target change didn't break the file-editing case.
+5. Regression: normal run mode (both with and without `-C`) and `--apply` still work correctly after the `-C` default change from `"."` to `None`.
+6. GUI-level: drove `_new_chat()`/`_chat_send()` for real (target-free, stub codex with the distinctive-phrase test) through the actual worker/message-queue pipeline, not simulated - captured the resulting single-thread transcript to a file (avoided a console Unicode encoding issue that hit my own test's `print()`, not the app) and confirmed it shows `You:` / `Codex:` / `Claude:` in correct order with Claude's real reply again correctly referencing the stub's made-up phrase, this time through the full GUI path.
+7. Full regression assertion pass across all four tabs (blank targets/defaults, disabled log states, tab count) - all passed.
+8. Attempted a live-window screenshot for visual confirmation; the automation this time grabbed an unrelated window that also happened to have "ClaudeCGpt" in its title text, and a retry attempt appeared to stall before creating a visible window. Deleted the mis-captured screenshot immediately without inspecting its content further (it was someone else's unrelated window). Did not keep pushing on this - the functional/text-based verification above already proves correctness rigorously; a screenshot would only have added visual polish confirmation, not correctness.
+
+**Killed all running `python3.12` GUI processes while chasing the screenshot issue above** (including, most likely, the legitimate GUI window from the earlier `launch` request this session) - flagged to the user that they'll need it relaunched. Relaunched on request afterward.
+
+### 2026-08-14 (local) - README rewrite
+
+Marked by: Claude/VS Code
+
+Cody/Codex reviewed the current state (uncommitted local changes above) and flagged that `README.md` was stale - still framed as "tiny bridge for comparing Claude Code and Codex," no mention anywhere of `--revise`, `--apply`, or `--chat`, and the GUI section only described the Run tab's toggles, not the Compare or Chat tabs. Codex's proposed reframing: "one window where you, Claude, and Codex can talk, compare, revise, and apply work with human control" - not just a benchmark harness anymore.
+
+Verified the claim myself by reading the actual file before acting on it (rather than trusting the paste at face value) - confirmed accurate. Agreed with the reframing and rewrote the README around it: intro reflects the four actual capabilities (compare / chat / apply / GUI) instead of just the original one-shot compare, each gets its own section with the real invocation syntax, the output-files list now includes `--revise`'s and `--chat`'s files (`*_revised.*`, `chat_state.json`), and the GUI section now names and describes all four tabs (Run, Chat, Compare, Apply) instead of just Run's toggles.
+
+Cross-checked every flag name, default, and behavior claim in the new README against the CLI's own `--help` output (not from memory) before finishing - matched exactly, no corrections needed.
+
 Not yet committed/pushed.

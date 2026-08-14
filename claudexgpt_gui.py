@@ -97,6 +97,7 @@ class ClaudeCGptGui(tk.Tk):
         self.chat_timeout_var = tk.StringVar(value="300")
         self.chat_yolo_var = tk.BooleanVar(value=False)
         self.chat_status_var = tk.StringVar(value="No conversation started.")
+        self.chat_first_var = tk.StringVar(value="codex")
 
         self._configure_styles()
         self._build_ui()
@@ -235,32 +236,33 @@ class ClaudeCGptGui(tk.Tk):
         self.log_text = self._make_log(parent)
 
     def _build_chat_tab(self, parent):
-        self._path_row(parent, "Target", self.chat_target_var, self._browse_chat_target)
+        self._path_row(parent, "Target (optional)", self.chat_target_var, self._browse_chat_target)
 
         top = ttk.Frame(parent, style="Panel.TFrame")
         top.pack(fill=tk.X, pady=(4, 10))
         ttk.Button(top, text="New Conversation", style="Accent.TButton", command=self._new_chat).pack(side=tk.LEFT)
+        ttk.Label(top, text="First to speak", style="Panel.TLabel").pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Combobox(
+            top, textvariable=self.chat_first_var, values=("codex", "claude"), state="readonly", width=8,
+        ).pack(side=tk.LEFT)
         ttk.Checkbutton(top, text="Yolo", variable=self.chat_yolo_var).pack(side=tk.LEFT, padx=(14, 4))
         ttk.Label(top, text="Timeout", style="Panel.TLabel").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(top, textvariable=self.chat_timeout_var, width=8).pack(side=tk.LEFT)
         ttk.Label(top, textvariable=self.chat_status_var, style="Panel.TLabel").pack(side=tk.LEFT, padx=(16, 0))
 
-        columns = ttk.Frame(parent, style="Panel.TFrame")
-        columns.pack(fill=tk.BOTH, expand=True)
-        columns.columnconfigure(0, weight=1)
-        columns.columnconfigure(1, weight=1)
-        columns.rowconfigure(1, weight=1)
+        ttk.Label(
+            parent,
+            text="A real 3-way conversation, not two separate one-on-ones: each turn is sequential, and "
+                 "whoever replies second is shown what the other one just said, so they're actually "
+                 "responding to each other.",
+            style="Panel.TLabel", wraplength=1000,
+        ).pack(anchor="w", pady=(0, 8))
 
-        tk.Label(columns, text="CLAUDE", bg=COLORS["panel"], fg=COLORS["claude"], font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
-        tk.Label(columns, text="GPT / CODEX", bg=COLORS["panel"], fg=COLORS["gpt"], font=("Segoe UI", 11, "bold")).grid(row=0, column=1, sticky="w", padx=(8, 0))
-
-        claude_frame = ttk.Frame(columns, style="Panel.TFrame")
-        claude_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        self.chat_claude_text = self._make_log(claude_frame)
-
-        codex_frame = ttk.Frame(columns, style="Panel.TFrame")
-        codex_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
-        self.chat_codex_text = self._make_log(codex_frame)
+        self.chat_thread_text = self._make_log(parent)
+        self.chat_thread_text.tag_configure("chat_you", foreground=COLORS["human"], font=("Consolas", 9, "bold"))
+        self.chat_thread_text.tag_configure("chat_claude", foreground=COLORS["claude_soft"], font=("Consolas", 9, "bold"))
+        self.chat_thread_text.tag_configure("chat_codex", foreground=COLORS["gpt"], font=("Consolas", 9, "bold"))
+        self.chat_thread_text.tag_configure("chat_error", foreground=COLORS["danger"])
 
         ttk.Label(parent, text="Message", style="Panel.TLabel").pack(anchor="w", pady=(10, 4))
         self.chat_input = tk.Text(
@@ -271,27 +273,27 @@ class ClaudeCGptGui(tk.Tk):
 
         buttons = ttk.Frame(parent, style="Panel.TFrame")
         buttons.pack(fill=tk.X, pady=(8, 0))
-        self.chat_send_button = ttk.Button(buttons, text="Send to Both", style="Human.TButton", command=self._chat_send, state=tk.DISABLED)
+        self.chat_send_button = ttk.Button(buttons, text="Send", style="Human.TButton", command=self._chat_send, state=tk.DISABLED)
         self.chat_send_button.pack(side=tk.LEFT)
         self.chat_stop_button = ttk.Button(buttons, text="Stop", style="Danger.TButton", command=self._stop_chat_process, state=tk.DISABLED)
         self.chat_stop_button.pack(side=tk.LEFT, padx=8)
         ttk.Button(buttons, text="View in Compare", command=self._view_chat_in_compare).pack(side=tk.LEFT, padx=8)
 
     def _browse_chat_target(self):
-        path = filedialog.askdirectory(title="Select target directory")
+        path = filedialog.askdirectory(title="Select target directory (optional)")
         if path:
             self.chat_target_var.set(path)
 
     def _new_chat(self):
-        target = self.chat_target_var.get()
-        if not target or not Path(target).is_dir():
-            messagebox.showerror("Missing target", "Choose a valid target directory first.")
-            return
+        # Target is optional here (unlike Run/Apply) - a 3-way conversation
+        # doesn't need a project directory at all, just two AIs and a human.
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.chat_dir = Path(self.outputs_var.get()) / f"chat_{timestamp}"
-        self._clear_log(self.chat_claude_text)
-        self._clear_log(self.chat_codex_text)
-        self.chat_status_var.set(f"New conversation: {self.chat_dir.name} (not sent yet)")
+        self._clear_log(self.chat_thread_text)
+        target = self.chat_target_var.get()
+        self.chat_status_var.set(
+            f"New conversation: {self.chat_dir.name}" + (f" (target: {target})" if target else " (no target)")
+        )
         self.chat_send_button.configure(state=tk.NORMAL)
 
     def _chat_send(self):
@@ -304,21 +306,23 @@ class ClaudeCGptGui(tk.Tk):
         message = self.chat_input.get("1.0", tk.END).strip()
         if not message:
             return
-        target = self.chat_target_var.get()
-        if not target or not Path(target).is_dir():
-            messagebox.showerror("Missing target", "Choose a valid target directory.")
-            return
 
-        self._append_log(self.chat_claude_text, f"You: {message}\n\n")
-        self._append_log(self.chat_codex_text, f"You: {message}\n\n")
+        self._append_chat("You: ", "chat_you")
+        self._append_chat(message + "\n\n")
         self.chat_input.delete("1.0", tk.END)
 
         cmd = [
             self.python_var.get(), str(CLI_PATH), message,
             "--chat", str(self.chat_dir),
-            "-C", target,
+            "--chat-first", self.chat_first_var.get(),
             "--timeout", self.chat_timeout_var.get(),
         ]
+        target = self.chat_target_var.get()
+        if target:
+            # Blank means "no target" to the CLI too (see run_chat_mode) -
+            # only pass -C when there's a real value, never an empty string
+            # (Path("").is_dir() is True, same footgun fixed in Run/Apply).
+            cmd += ["-C", target]
         if self.chat_yolo_var.get():
             cmd.append("--yolo")
 
@@ -342,22 +346,36 @@ class ClaudeCGptGui(tk.Tk):
             self.chat_proc = None
             self.messages.put(("CHAT_DONE", None))
 
+    def _append_chat(self, text, tag=None):
+        self.chat_thread_text.configure(state=tk.NORMAL)
+        self.chat_thread_text.insert(tk.END, text, tag) if tag else self.chat_thread_text.insert(tk.END, text)
+        self.chat_thread_text.see(tk.END)
+        self.chat_thread_text.configure(state=tk.DISABLED)
+
     def _render_chat_result(self, stdout, stderr, code):
-        for name, text_widget in (("CLAUDE", self.chat_claude_text), ("CODEX", self.chat_codex_text)):
-            begin = f"###CLAUDEXGPT_CHAT_{name}_BEGIN###"
-            end = f"###CLAUDEXGPT_CHAT_{name}_END###"
-            start_idx = stdout.find(begin)
-            end_idx = stdout.find(end)
+        # Blocks appear in the CLI's actual speaking order for that round
+        # (see run_chat_mode) - sort by where each marker shows up rather
+        # than a fixed claude-then-codex order, so the thread reads as a
+        # real back-and-forth instead of always favoring one side visually.
+        blocks = []
+        for name in ("CLAUDE", "CODEX"):
+            begin, end = f"###CLAUDEXGPT_CHAT_{name}_BEGIN###", f"###CLAUDEXGPT_CHAT_{name}_END###"
+            start_idx, end_idx = stdout.find(begin), stdout.find(end)
             if start_idx != -1 and end_idx != -1:
-                content = stdout[start_idx + len(begin):end_idx].strip("\n")
-                self._append_log(text_widget, content + "\n\n")
-            else:
-                self._append_log(text_widget, "(no response found - the CLI call may have failed before replying)\n\n")
+                blocks.append((start_idx, name, stdout[start_idx + len(begin):end_idx].strip("\n")))
+        blocks.sort(key=lambda b: b[0])
+
+        for _, name, content in blocks:
+            label, tag = ("Claude", "chat_claude") if name == "CLAUDE" else ("Codex", "chat_codex")
+            self._append_chat(f"{label}: ", tag)
+            self._append_chat(content + "\n\n")
+        if not blocks:
+            self._append_chat("(no response found - the CLI call may have failed before replying)\n\n", "chat_error")
         if code != 0:
             note = f"[claudexgpt --chat exited {code}]"
             if stderr.strip():
                 note += f"\n{stderr.strip()}"
-            self._append_log(self.chat_claude_text, note + "\n\n")
+            self._append_chat(note + "\n\n", "chat_error")
 
     def _stop_chat_process(self):
         if self.chat_proc is not None:
@@ -779,8 +797,7 @@ class ClaudeCGptGui(tk.Tk):
                     stdout, stderr, code = payload
                     self._render_chat_result(stdout, stderr, code)
                 elif target == "CHAT_ERROR":
-                    self._append_log(self.chat_claude_text, f"[error] {payload}\n\n")
-                    self._append_log(self.chat_codex_text, f"[error] {payload}\n\n")
+                    self._append_chat(f"[error] {payload}\n\n", "chat_error")
                 elif target == "CHAT_DONE":
                     self.chat_send_button.configure(state=tk.NORMAL)
                     self.chat_stop_button.configure(state=tk.DISABLED)
