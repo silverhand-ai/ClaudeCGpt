@@ -152,6 +152,8 @@ class ClaudeCGptGui(tk.Tk):
         self.bridge.pack(side=tk.RIGHT)
         self._draw_bridge()
 
+        ttk.Button(header, text="Restart", command=self._restart_app).pack(side=tk.RIGHT, anchor="n", padx=(0, 12))
+
         self.tabs = ttk.Notebook(root)
         self.tabs.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
 
@@ -827,13 +829,28 @@ class ClaudeCGptGui(tk.Tk):
         except (OSError, subprocess.TimeoutExpired):
             pass
 
-    def _on_close(self):
-        # Closing the window shouldn't leave a claude/codex call running
-        # unattended in the background - same reasoning as the Stop button.
+    def _kill_all_running(self):
+        # Shared by close and restart - neither should leave a claude/codex
+        # call running unattended in the background, same reasoning as the
+        # Stop button.
         if self.proc is not None:
             self._kill_process_tree(self.proc.pid)
         if self.chat_proc is not None:
             self._kill_process_tree(self.chat_proc.pid)
+
+    def _on_close(self):
+        self._kill_all_running()
+        self.destroy()
+
+    def _restart_app(self):
+        if not messagebox.askyesno("Restart", "Close and relaunch ClaudeCGpt now? Any running message/task will be stopped."):
+            return
+        self._kill_all_running()
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())], cwd=str(APP_DIR))
+        except OSError as e:
+            messagebox.showerror("Restart failed", f"Could not relaunch: {e}")
+            return
         self.destroy()
 
     def _open_latest_output(self):

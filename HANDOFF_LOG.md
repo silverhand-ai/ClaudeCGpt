@@ -540,4 +540,80 @@ Verified the claim myself by reading the actual file before acting on it (rather
 
 Cross-checked every flag name, default, and behavior claim in the new README against the CLI's own `--help` output (not from memory) before finishing - matched exactly, no corrections needed.
 
+Committed and pushed as `baf8675`.
+
+### 2026-08-14 (local) - fixed a real crash: emoji in a reply crashed the whole process
+
+Marked by: Claude/VS Code
+
+User tried the redesigned Chat tab for real: sent "say hello world!", Codex's reply printed fine, then the whole thing crashed with `UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f44b'` right as Claude's reply (which included a 👋 emoji) was being printed.
+
+Root cause: on Windows, `sys.stdout`/`sys.stderr` default to the system ANSI codepage (`cp1252` here) instead of UTF-8 whenever they aren't attached to a real console - which is always true here, since the GUI captures `claudexgpt.py`'s output through a pipe (`subprocess.Popen(..., stdout=subprocess.PIPE, ...)`). `cp1252` can't represent most emoji, so any `print()` containing one crashes the whole process outright. This isn't chat-specific - it could hit any mode (Run, Apply, Chat) any time a reply happens to contain an emoji or other non-Latin1 character, which language models do fairly often in casual conversation.
+
+Fix: added `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` / same for `stderr`, right at the top of `main()`, before anything else prints - covers every mode uniformly rather than patching each print site individually.
+
+Verification:
+```powershell
+C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt.py
+```
+Compiled clean.
+
+- Isolated the exact mechanism directly: confirmed a bare `print("Hello world! 👋")` with piped stdout and no reconfigure crashes with the identical error the user saw; the same print with `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` first prints correctly.
+- Full authentic end-to-end confirmation: real Claude, asked to reply with literally "Hello world!" plus a waving-hand emoji, through the actual `--chat` mode, with stdout piped exactly the way the GUI captures it (not a console) - printed `Hello world! 👋` correctly, exit code 0, no crash. Exact same scenario the user hit, now fixed.
+- Note on the test process itself: the first attempt at this end-to-end check appeared to crash too, but the traceback was in my *own throwaway test harness's* `print(proc.stdout)` line, not inside `claudexgpt.py` - the child process had already exited 0 by that point (confirmed by an `exit code:` line that printed successfully first). My test harness script didn't have the same reconfigure applied to itself. Added it there too and got a clean result. Not a product bug, just something to remember about Windows console encoding biting test scripts too, not just the tool being tested.
+
+No GUI restart needed for this one, unlike the earlier blank-target fix - `claudexgpt_gui.py` doesn't embed any of this logic itself, it launches a fresh `claudexgpt.py` subprocess per message, so the fix applies automatically to the very next message sent.
+
+### 2026-08-14 (local) - added a Restart button to the GUI
+
+Marked by: Claude/VS Code
+
+User asked for a close-and-relaunch button - this has come up organically several times this session (GUI code fixes need the window restarted to take effect, and up to now that meant me killing the process externally and relaunching `launch_gui.cmd` on request each time).
+
+Added a "Restart" button in the header (next to the bridge graphic). `_restart_app()`: confirms with the user first (any in-flight message/run would be stopped), reuses the existing `_kill_process_tree`-based cleanup (factored the shared bit out of `_on_close` into `_kill_all_running()`, now used by both), then relaunches itself via `subprocess.Popen([sys.executable, str(Path(__file__).resolve())], cwd=str(APP_DIR))` and destroys the current window. Doesn't depend on knowing it was started via `launch_gui.cmd` - relaunches using its own interpreter and file path directly, so it works the same regardless of how the current instance was originally started.
+
+Verification:
+```powershell
+C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py
+```
+Compiled clean.
+
+- Decline path: mocked the confirmation dialog to say no, confirmed the window is untouched (`winfo_exists()` still succeeds - checked *before* any destroy call, unlike a mistake I made further down).
+- Accept path: mocked the confirmation dialog to say yes, called `_restart_app()` for real, confirmed it returns without raising and a new process is genuinely alive afterward.
+- Hit a false alarm chasing this: my first couple of verification attempts filtered running processes by name `python3.12` and found nothing, looking like the relaunch was silently failing. Root cause was in my *test's* assumptions, not the code: `sys.executable` (correctly) resolves through the `C:\Users\Rebel\.local\bin\python3.12.exe` shim to the real underlying interpreter at `...\AppData\Roaming\uv\python\...\python.exe`, whose actual Windows process name is `python`, not `python3.12`. Filtering for both names found the real (correctly alive) relaunched processes. No bug - just a reminder that this machine's "python3.12.exe" is a differently-named shim over the real binary, worth remembering for future process-checking here.
+- Left four leftover live GUI windows running in the background from repeated test iterations (each an independently-successful relaunch, just never closed since each test only verified spawn-success) - cleaned all of them up before finishing.
+
 Not yet committed/pushed.
+
+### 2026-08-14 (local) - fixed Codex chat resume flag bug
+
+Marked by: Cody/Codex
+
+User pasted a real Chat transcript where the first turn worked, then Codex failed on the next turn with:
+
+```text
+error: unexpected argument '-s' found
+Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]
+```
+
+Root cause:
+
+- Fresh `codex exec - ... -s workspace-write` supports `-s`.
+- `codex exec resume <session> - ...` does **not** support `-s/--sandbox`.
+- `run_chat_mode()` used the same sandbox flag append for fresh and resumed Codex chat calls, so every resumed Codex turn failed before the model ran.
+
+Fix:
+
+- For fresh Codex chat calls, keep existing behavior:
+  - normal: `codex exec - --skip-git-repo-check -s workspace-write`
+  - yolo: `codex exec - --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`
+- For resumed Codex chat calls, omit `-s workspace-write` because the subcommand does not accept it:
+  - normal: `codex exec resume <session> - --skip-git-repo-check`
+  - yolo: `codex exec resume <session> - --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`
+
+Verification:
+
+- `codex exec resume --help` confirms the resume subcommand has `--skip-git-repo-check` and `--dangerously-bypass-approvals-and-sandbox`, but no `-s/--sandbox`.
+- `D:\Tools\Python\3.14.7\python.exe -m py_compile claudexgpt.py` passed.
+- `C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py claudexgpt.py` passed.
+- `D:\Tools\Python\3.14.7\python.exe claudexgpt.py --help` still renders the expected chat/apply flags.

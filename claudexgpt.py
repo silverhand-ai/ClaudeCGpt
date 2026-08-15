@@ -507,9 +507,11 @@ def run_chat_mode(args, message):
         else:
             if state["codex_session_id"]:
                 cmd = [CODEX_BIN, "exec", "resume", state["codex_session_id"], "-", "--skip-git-repo-check"]
+                if args.yolo:
+                    cmd += ["--dangerously-bypass-approvals-and-sandbox"]
             else:
                 cmd = [CODEX_BIN, "exec", "-", "--skip-git-repo-check"]
-            cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
+                cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
         return cmd, ws
 
     results = {}
@@ -552,6 +554,16 @@ def run_chat_mode(args, message):
 
 
 def main():
+    # On Windows, stdout/stderr default to the system ANSI codepage (cp1252
+    # here) instead of UTF-8 whenever they're not a real console - which is
+    # always true when the GUI captures this process's output via a pipe.
+    # Claude/Codex replies routinely contain emoji or other non-Latin1
+    # characters, and print() on those crashes outright under cp1252
+    # (confirmed: this happened for real, mid-chat, from "Hello world! 👋").
+    # Force UTF-8 unconditionally, before anything else prints.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         prog="claudexgpt",
         description="Run a task through Claude Code and Codex CLI non-interactively; save outputs; show diffs. No merging, no deciding.",
