@@ -98,6 +98,8 @@ class ClaudeCGptGui(tk.Tk):
         self.chat_yolo_var = tk.BooleanVar(value=False)
         self.chat_status_var = tk.StringVar(value="No conversation started.")
         self.chat_first_var = tk.StringVar(value="codex")
+        self.chat_discuss_var = tk.BooleanVar(value=False)
+        self.chat_discussion_rounds_var = tk.StringVar(value="1")
 
         self._configure_styles()
         self._build_ui()
@@ -247,6 +249,9 @@ class ClaudeCGptGui(tk.Tk):
         ttk.Combobox(
             top, textvariable=self.chat_first_var, values=("codex", "claude"), state="readonly", width=8,
         ).pack(side=tk.LEFT)
+        ttk.Checkbutton(top, text="Discussion", variable=self.chat_discuss_var).pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Label(top, text="Rounds", style="Panel.TLabel").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Entry(top, textvariable=self.chat_discussion_rounds_var, width=4).pack(side=tk.LEFT)
         ttk.Checkbutton(top, text="Yolo", variable=self.chat_yolo_var).pack(side=tk.LEFT, padx=(14, 4))
         ttk.Label(top, text="Timeout", style="Panel.TLabel").pack(side=tk.LEFT, padx=(10, 4))
         ttk.Entry(top, textvariable=self.chat_timeout_var, width=8).pack(side=tk.LEFT)
@@ -280,6 +285,7 @@ class ClaudeCGptGui(tk.Tk):
         self.chat_stop_button = ttk.Button(buttons, text="Stop", style="Danger.TButton", command=self._stop_chat_process, state=tk.DISABLED)
         self.chat_stop_button.pack(side=tk.LEFT, padx=8)
         ttk.Button(buttons, text="View in Compare", command=self._view_chat_in_compare).pack(side=tk.LEFT, padx=8)
+        ttk.Button(buttons, text="Open Transcript", command=self._open_chat_transcript).pack(side=tk.LEFT)
 
     def _browse_chat_target(self):
         path = filedialog.askdirectory(title="Select target directory (optional)")
@@ -319,6 +325,8 @@ class ClaudeCGptGui(tk.Tk):
             "--chat-first", self.chat_first_var.get(),
             "--timeout", self.chat_timeout_var.get(),
         ]
+        if self.chat_discuss_var.get():
+            cmd += ["--discuss", "--discussion-rounds", self.chat_discussion_rounds_var.get()]
         target = self.chat_target_var.get()
         if target:
             # Blank means "no target" to the CLI too (see run_chat_mode) -
@@ -359,15 +367,13 @@ class ClaudeCGptGui(tk.Tk):
         # (see run_chat_mode) - sort by where each marker shows up rather
         # than a fixed claude-then-codex order, so the thread reads as a
         # real back-and-forth instead of always favoring one side visually.
-        blocks = []
-        for name in ("CLAUDE", "CODEX"):
-            begin, end = f"###CLAUDEXGPT_CHAT_{name}_BEGIN###", f"###CLAUDEXGPT_CHAT_{name}_END###"
-            start_idx, end_idx = stdout.find(begin), stdout.find(end)
-            if start_idx != -1 and end_idx != -1:
-                blocks.append((start_idx, name, stdout[start_idx + len(begin):end_idx].strip("\n")))
-        blocks.sort(key=lambda b: b[0])
+        pattern = re.compile(
+            r"###CLAUDEXGPT_CHAT_(CLAUDE|CODEX)_BEGIN###\n?(.*?)\n?###CLAUDEXGPT_CHAT_\1_END###",
+            re.DOTALL,
+        )
+        blocks = [(m.start(), m.group(1), m.group(2).strip("\n")) for m in pattern.finditer(stdout)]
 
-        for _, name, content in blocks:
+        for _, name, content in sorted(blocks, key=lambda b: b[0]):
             label, tag = ("Claude", "chat_claude") if name == "CLAUDE" else ("Codex", "chat_codex")
             self._append_chat(f"{label}: ", tag)
             self._append_chat(content + "\n\n")
@@ -391,6 +397,16 @@ class ClaudeCGptGui(tk.Tk):
         self.compare_run_var.set(str(self.chat_dir))
         self._load_compare_run()
         self.tabs.select(self.compare_tab)
+
+    def _open_chat_transcript(self):
+        if self.chat_dir is None:
+            messagebox.showerror("No conversation", "Start a conversation first.")
+            return
+        path = self.chat_dir / "chat_transcript.md"
+        if not path.exists():
+            messagebox.showinfo("No transcript yet", "Send a message first; the transcript is created after each turn.")
+            return
+        self._open_path(path)
 
     def _build_compare_tab(self, parent):
         self._path_row(parent, "Run Dir", self.compare_run_var, self._browse_compare_run)

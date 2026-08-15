@@ -40,11 +40,11 @@ picking --apply-which; there is still no auto-merge, scoring, or winner.
 Optional --chat <chat_dir>: one turn of a persistent multi-turn conversation
 with both tools, kept alive via claude --resume / codex exec resume (session
 ids stored in <chat_dir>/chat_state.json). If <chat_dir> doesn't exist yet,
-this is turn 1 and -C/--dir must point at the target to copy into fresh
-workspaces there; later turns reuse the same workspaces and -C is ignored.
-The message for the turn is the normal task argument/--task-file/prompt.
-Diffs are refreshed after each turn using the same filenames a normal run
-produces, so a chat directory is fully usable from the GUI's existing
+this is turn 1; pass -C/--dir to chat inside a copy of a project, or omit it
+for a target-free conversation. Add --discuss for bounded extra agent-to-agent
+discussion rounds. Full logs are appended to chat_transcript.md and
+chat_turns.jsonl. Diffs are refreshed after each turn using the same filenames
+a normal run produces, so a chat directory is fully usable from the GUI's
 Compare/Apply tabs (or --apply) without any special-casing.
 """
 
@@ -411,6 +411,7 @@ CHAT_BEGIN = "###CLAUDEXGPT_CHAT_{}_BEGIN###"
 CHAT_END = "###CLAUDEXGPT_CHAT_{}_END###"
 
 OTHER_NAME = {"claude": "Codex/GPT", "codex": "Claude"}
+DISPLAY_NAME = {"claude": "Claude", "codex": "Codex"}
 
 
 def build_crosstalk_message(human_message, other_display_name, other_reply):
@@ -423,6 +424,56 @@ def build_crosstalk_message(human_message, other_display_name, other_reply):
         f"[{other_display_name} just said, in our shared 3-way conversation]:\n{other_reply.strip()}\n\n"
         f"[Now responding to the human, who said]:\n{human_message}"
     )
+
+
+def build_discussion_message(human_message, other_display_name, other_reply, round_num, total_rounds):
+    if not other_reply:
+        return (
+            "Continue the shared 3-way conversation. The human is letting you and the other AI "
+            "put your brains together before they respond again.\n\n"
+            f"Original human message for this turn:\n{human_message}\n\n"
+            f"Discussion round {round_num} of {total_rounds}: add your best thinking, note useful "
+            "agreements or disagreements, and be concise."
+        )
+    return (
+        "Continue the shared 3-way conversation. The human is letting you and the other AI put "
+        "your brains together before they respond again.\n\n"
+        f"Original human message for this turn:\n{human_message}\n\n"
+        f"[{other_display_name} just said]:\n{other_reply.strip()}\n\n"
+        f"Discussion round {round_num} of {total_rounds}: respond to them directly, sharpen the "
+        "shared understanding, call out any disagreement that matters, and be concise. Do not "
+        "wait for the human; this is the two of you thinking together."
+    )
+
+
+def append_chat_logs(chat_dir, records):
+    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+    transcript_path = chat_dir / "chat_transcript.md"
+    jsonl_path = chat_dir / "chat_turns.jsonl"
+
+    with transcript_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n## Turn {timestamp}\n\n")
+        for record in records:
+            speaker = record["speaker"]
+            phase = record.get("phase")
+            status = record.get("status")
+            suffix = f" ({phase})" if phase and phase != "human" else ""
+            f.write(f"### {speaker}{suffix}\n\n")
+            if status:
+                f.write(f"_status: {status}")
+                if record.get("returncode") is not None:
+                    f.write(f" (exit {record['returncode']})")
+                f.write("_\n\n")
+            f.write((record.get("text") or "(empty)").rstrip() + "\n\n")
+            if record.get("stderr"):
+                f.write("<details><summary>stderr</summary>\n\n```text\n")
+                f.write(record["stderr"].rstrip() + "\n")
+                f.write("```\n\n</details>\n\n")
+
+    with jsonl_path.open("a", encoding="utf-8") as f:
+        for record in records:
+            item = {"timestamp": timestamp, **record}
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def run_chat_mode(args, message):
@@ -514,15 +565,19 @@ def run_chat_mode(args, message):
                 cmd += ["--dangerously-bypass-approvals-and-sandbox"] if args.yolo else ["-s", "workspace-write"]
         return cmd, ws
 
-    results = {}
-    for name in order:
-        other = "codex" if name == "claude" else "claude"
-        other_reply = results[other]["stdout"] if other in results else state.get(f"last_{other}_reply")
-        turn_message = build_crosstalk_message(message, OTHER_NAME[name], other_reply)
+    if args.discussion_rounds < 0:
+        print("--discussion-rounds cannot be negative.", file=sys.stderr)
+        sys.exit(1)
 
+    results = {}
+    spoken = []
+    records = [{"speaker": "You", "phase": "human", "text": message}]
+
+    def run_speaker(name, prompt, phase):
         cmd, ws = build_cmd(name)
-        result = run_tool(name, cmd, ws, args.timeout, turn_message)
+        result = run_tool(name, cmd, ws, args.timeout, prompt)
         results[name] = result
+        spoken.append((name, result))
 
         if name == "codex" and not state.get("codex_session_id"):
             m = re.search(r"session id:\s*([0-9a-fA-F-]+)", result.get("stderr") or "")
@@ -532,15 +587,42 @@ def run_chat_mode(args, message):
         if result["status"] == "ok":
             state[f"last_{name}_reply"] = result["stdout"]
 
+        records.append({
+            "speaker": DISPLAY_NAME[name],
+            "tool": name,
+            "phase": phase,
+            "status": result["status"],
+            "returncode": result["returncode"],
+            "text": result["stdout"] or "(empty)",
+            "stderr": result["stderr"] if result["status"] != "ok" else "",
+        })
+        return result
+
+    for name in order:
+        other = "codex" if name == "claude" else "claude"
+        other_reply = results[other]["stdout"] if other in results else state.get(f"last_{other}_reply")
+        turn_message = build_crosstalk_message(message, OTHER_NAME[name], other_reply)
+        run_speaker(name, turn_message, "response")
+
+    if args.discuss and len(available) > 1:
+        for round_num in range(1, args.discussion_rounds + 1):
+            for name in order:
+                other = "codex" if name == "claude" else "claude"
+                discussion_message = build_discussion_message(
+                    message, OTHER_NAME[name], state.get(f"last_{other}_reply"), round_num, args.discussion_rounds
+                )
+                run_speaker(name, discussion_message, f"discussion {round_num}")
+
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     for name, ws in (("claude", claude_ws), ("codex", codex_ws)):
         if name in results and ws.is_dir() and is_git_repo(ws):
             (chat_dir / f"{name}.diff").write_text(get_diff(ws), encoding="utf-8")
 
-    for name in order:
+    append_chat_logs(chat_dir, records)
+
+    for name, r in spoken:
         print(CHAT_BEGIN.format(name.upper()))
-        r = results[name]
         print(f"status: {r['status']}" + (f" (exit {r['returncode']})" if r["returncode"] is not None else ""))
         if r["error"]:
             print(f"error: {r['error']}")
@@ -618,6 +700,17 @@ def main():
         "--chat-first", choices=("claude", "codex"), default="codex",
         help="Which tool responds first in each --chat round (default: codex). The other one then sees "
              "what it just said before replying.",
+    )
+    parser.add_argument(
+        "--discuss", action="store_true",
+        help="With --chat, after the normal human-triggered round, let Claude and Codex trade extra "
+             "agent-to-agent discussion rounds before returning control to the human. Bounded by "
+             "--discussion-rounds. Off by default.",
+    )
+    parser.add_argument(
+        "--discussion-rounds", type=int, default=1,
+        help="How many extra Claude/Codex back-and-forth discussion rounds to run when --discuss is set "
+             "(default: 1). Ignored unless --discuss is used.",
     )
     parser.add_argument(
         "--outputs-dir", default=DEFAULT_OUTPUTS_DIR,

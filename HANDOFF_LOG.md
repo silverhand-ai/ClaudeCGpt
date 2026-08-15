@@ -617,3 +617,44 @@ Verification:
 - `D:\Tools\Python\3.14.7\python.exe -m py_compile claudexgpt.py` passed.
 - `C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py claudexgpt.py` passed.
 - `D:\Tools\Python\3.14.7\python.exe claudexgpt.py --help` still renders the expected chat/apply flags.
+
+### 2026-08-14 (local) - chat transcripts and bounded discussion mode
+
+Marked by: Cody/Codex
+
+User asked whether conversations are logged, then asked to add logs and a "discussion mode" so Claude and Codex can put their brains together.
+
+What I changed:
+
+- Added `chat_transcript.md` in each chat directory.
+- Added `chat_turns.jsonl` in each chat directory.
+- Every `--chat` call now appends the human message and every Claude/Codex response from that turn.
+- Added CLI flags:
+  - `--discuss`
+  - `--discussion-rounds N`
+- With `--discuss`, the normal human-triggered chat round still happens first, then Claude and Codex trade `N` extra bounded discussion rounds before returning control to the human.
+- Added GUI Chat controls:
+  - `Discussion` checkbox.
+  - `Rounds` field.
+  - `Open Transcript` button.
+- Updated GUI chat-result parsing so repeated Claude/Codex marker blocks from discussion mode render in order, instead of only showing one block per agent.
+- Updated README to describe transcript files and discussion mode.
+
+Why:
+
+- The tool's new center is real 3-way conversation, and a running GUI-only transcript is not enough. Conversation history needs durable, readable files.
+- Discussion mode must be bounded so agents can collaborate without accidentally creating an infinite loop or runaway quota burn.
+
+Verification:
+
+- `D:\Tools\Python\3.14.7\python.exe -m py_compile claudexgpt.py` passed.
+- `C:\Users\Rebel\.local\bin\python3.12.exe -m py_compile claudexgpt_gui.py claudexgpt.py` passed.
+- No-API CLI smoke test passed with temporary `claude.cmd`/`codex.cmd` stubs:
+  - `--chat ... --discuss --discussion-rounds 1` produced the normal response round plus one extra discussion round.
+  - Fresh Codex call used `codex exec - --skip-git-repo-check -s workspace-write`.
+  - Resumed Codex discussion call used `codex exec resume <session> - --skip-git-repo-check` with no invalid `-s`.
+  - `chat_transcript.md` was written.
+  - `chat_turns.jsonl` was written with 5 records: human, Codex response, Claude response, Codex discussion, Claude discussion.
+- GUI parser smoke test passed:
+  - Fed repeated Codex/Claude marker blocks into `_render_chat_result`.
+  - Confirmed the Chat thread rendered two Codex blocks and one Claude block in order.

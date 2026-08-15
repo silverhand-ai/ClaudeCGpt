@@ -51,9 +51,15 @@ python .\claudexgpt.py "hey, what do you two think about..." --chat "F:\ClaudeXG
 
 Not two independent one-on-ones with the same human - a real conversation. Turns are sequential: whichever tool replies second in a round is shown what the first one *just* said, and each side's latest reply carries forward round to round (`--chat-first {codex,claude}`, default `codex`, picks who goes first). Session continuity is real `claude --resume` / `codex exec resume`, not prompt-stuffing.
 
+Add `--discuss` when you want them to put their brains together before control returns to you. It runs the normal human-triggered round, then adds bounded agent-to-agent discussion rounds:
+
+```powershell
+python .\claudexgpt.py "talk this through before I decide" --chat "F:\ClaudeXGPT_outputs\my_conversation" --discuss --discussion-rounds 2
+```
+
 `-C`/`--dir` is only needed on the *first* message of a new chat directory, and only if you want the conversation to happen inside a copy of a real project (so files can be read/edited as part of talking). Omit it for a target-free conversation - nothing gets copied, it's just the three of you talking. Later messages to the same chat directory ignore `-C` and reuse whatever was set up on turn 1.
 
-Diffs refresh after every turn using the same `claude.diff`/`codex.diff` filenames a normal run produces, so a chat directory works with `--apply` and the GUI's Compare/Apply tabs with no special-casing.
+Diffs refresh after every turn using the same `claude.diff`/`codex.diff` filenames a normal run produces, so a chat directory works with `--apply` and the GUI's Compare/Apply tabs with no special-casing. Chat directories also append a readable `chat_transcript.md` and structured `chat_turns.jsonl` after every turn.
 
 ### 3. Apply - pick one, apply it for real
 
@@ -72,7 +78,7 @@ python .\claudexgpt.py --apply "F:\ClaudeXGPT_outputs\20260101_120000" --apply-w
 Four tabs:
 
 - **Run** - target folder, task box, `Cross-review`/`Revise once`/`Keep workspaces`/`Yolo` toggles, live output log, open-latest-output.
-- **Chat** - the 3-way conversation as a single scrolling thread (You / Claude / Codex, color-coded), optional target, "First to speak" control.
+- **Chat** - the 3-way conversation as a single scrolling thread (You / Claude / Codex, color-coded), optional target, "First to speak" control, bounded discussion mode, and transcript opener.
 - **Compare** - load any run directory and see Claude's and Codex's diffs side by side with syntax coloring, an Original/Revised toggle per side, and the other tool's review of each diff shown underneath. "Apply this" jumps straight to Apply, pre-filled.
 - **Apply** - pick a run directory and a result, confirm, done.
 
@@ -90,6 +96,8 @@ Files you may see in a run/chat directory, depending on what was used:
 - `claude_revised_output.txt`/`claude_revised.diff`, `codex_revised_output.txt`/`codex_revised.diff` - with `--revise`
 - `claude_workspace\`, `codex_workspace\` - the disposable copies themselves (chat conversations keep these persistently, since the conversation continues inside them)
 - `chat_state.json` - session ids and last replies, chat directories only
+- `chat_transcript.md` - readable full conversation transcript, chat directories only
+- `chat_turns.jsonl` - structured append-only turn log, chat directories only
 
 The original target directory is copied before any tool touches anything (or not copied at all, for a target-free chat) - nothing here modifies your real files except `--apply`, on purpose, with confirmation.
 
